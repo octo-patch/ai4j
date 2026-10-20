@@ -107,7 +107,7 @@ public class MinimaxChatServiceTest {
         String[] models = {"MiniMax-M3.1-Flash", "MiniMax-M3", "MiniMax-M2.7",
                 "MiniMax-M2.1", "custom/minimax-deployment"};
         for (String model : models) {
-            for (String effort : new String[]{null, "low", "medium", "high"}) {
+            for (String effort : new String[]{null, "low", "medium", "high", "xhigh", "max"}) {
                 AtomicReference<Request> recorded = new AtomicReference<>();
                 Configuration configuration = capturingConfiguration(recorded);
                 io.github.lnyocly.ai4j.service.IChatService service =
@@ -149,7 +149,10 @@ public class MinimaxChatServiceTest {
         ChatCompletion request = ChatCompletion.builder().model("MiniMax-M3").reasoningEffort("low")
                 .extraBody("reasoning_effort", "high")
                 .messages(Collections.singletonList(ChatMessage.withUser("Hello"))).build();
-        new MinimaxChatService(capturingConfiguration(recorded)).chatCompletion(request);
+        Configuration configuration = capturingConfiguration(recorded);
+        configuration.getMinimaxConfig().setApiHost("https://api.minimaxi.com/");
+        new MinimaxChatService(configuration).chatCompletion(request);
+        Assert.assertEquals("https://api.minimaxi.com/v1/chat/completions", recorded.get().url().toString());
         okio.Buffer buffer = new okio.Buffer();
         recorded.get().body().writeTo(buffer);
         Assert.assertEquals("high", new com.fasterxml.jackson.databind.ObjectMapper()
