@@ -11,6 +11,7 @@ import io.github.lnyocly.ai4j.agent.model.AgentModelClient;
 import io.github.lnyocly.ai4j.agent.permission.AgentExecutionEnvironment;
 import io.github.lnyocly.ai4j.agent.permission.AgentPermissionPolicy;
 import io.github.lnyocly.ai4j.agent.tool.AgentToolRegistry;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolVisibility;
 import io.github.lnyocly.ai4j.agent.tool.ToolExecutor;
 import io.github.lnyocly.ai4j.agent.interceptor.ToolInterceptor;
 import io.github.lnyocly.ai4j.agent.interceptor.PromptInterceptor;
@@ -33,6 +34,9 @@ public class AgentContext {
     private AgentModelClient modelClient;
 
     private AgentToolRegistry toolRegistry;
+
+    /** Model-facing tool view; null preserves the historical all-tools behavior. */
+    private AgentToolVisibility toolVisibility;
 
     private ToolExecutor toolExecutor;
 
@@ -83,6 +87,19 @@ public class AgentContext {
     private Object toolChoice;
 
     private Boolean parallelToolCalls;
+
+    /**
+     * Upper bound on concurrent tool executions when {@link #parallelToolCalls} dispatch is active.
+     * Null or {@code <= 0} keeps the historical behavior: one thread per call in the batch.
+     */
+    private Integer maxParallelToolCalls;
+
+    /**
+     * Per-call timeout for parallel tool dispatch, in milliseconds. Null or {@code <= 0} means no
+     * timeout (historical behavior). A call that exceeds the budget is cancelled and recorded as a
+     * FAILED tool result; sibling calls in the same batch are not affected.
+     */
+    private Long toolCallTimeoutMillis;
 
     private Boolean store;
 

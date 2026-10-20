@@ -11,6 +11,13 @@ import io.github.lnyocly.ai4j.agent.session.AgentSessionStore;
 import io.github.lnyocly.ai4j.agent.session.InMemoryAgentSessionEventLog;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 public class Agent {
@@ -35,6 +42,41 @@ public class Agent {
         return runtime.run(baseContext, request);
     }
 
+    /**
+     * Runs this agent on a shared daemon-thread pool. Agent runs are
+     * blocking calls; callers that need tighter control over scheduling
+     * should use {@link #runAsync(AgentRequest, Executor)} with their own
+     * executor instead of the common pool.
+     */
+    public CompletableFuture<AgentResult> runAsync(AgentRequest request) {
+        return runAsync(request, AsyncExecutorHolder.EXECUTOR);
+    }
+
+    /**
+     * Runs this agent on the supplied executor. The returned future completes
+     * exceptionally with the underlying failure when {@link #run} throws.
+     */
+    public CompletableFuture<AgentResult> runAsync(AgentRequest request, Executor executor) {
+        Executor target = executor == null ? AsyncExecutorHolder.EXECUTOR : executor;
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                return run(request);
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        }, target);
+    }
+
+    /**
+     * Returns the immutable-by-convention base context used by this Agent.
+     * Harness integrations use {@link AgentContext#toBuilder()} to create a
+     * per-execution overlay; callers should not mutate the returned context in
+     * place while a run is active.
+     */
+    public AgentContext getContext() {
+        return baseContext;
+    }
+
     public void runStream(AgentRequest request, AgentListener listener) throws Exception {
         runtime.runStream(baseContext, request, listener);
     }
@@ -44,23 +86,58 @@ public class Agent {
     }
 
     public AgentSession newSession() {
-        return newSession(AgentSessionMetadata.create(), null);
+        return newSession(baseContext, AgentSessionMetadata.create(), null);
     }
 
-    private AgentSession newSession(AgentSessionMetadata metadata, String runId) {
-        AgentMemory memory = memorySupplier == null ? baseContext.getMemory() : memorySupplier.get();
+    /**
+     * Creates a session from a context overlay while retaining the Agent's
+     * configured memory supplier and runtime. This is intentionally additive:
+     * existing callers continue to use {@link #newSession()}.
+     */
+    public AgentSession newSessionWithContext(AgentContext context) {
+        return newSession(context == null ? baseContext : context, AgentSessionMetadata.create(), null);
+    }
+
+    /**
+     * Creates a fresh session with a host-selected stable identity. This is
+     * useful for business conversations whose id is owned by the application;
+     * it does not bind that identity to a Harness task.
+     */
+    public AgentSession newSessionWithIdentity(String sessionId,
+                                               String runId,
+                                               AgentContext context) {
+        AgentSessionMetadata metadata = new AgentSessionMetadata(sessionId, 0L, 0L, null);
+        return newSession(context == null ? baseContext : context, metadata, runId);
+    }
+
+    private AgentSession newSession(AgentContext context, AgentSessionMetadata metadata, String runId) {
+        AgentContext sourceContext = context == null ? baseContext : context;
+        if (sourceContext == null) {
+            throw new IllegalStateException("agent context is required");
+        }
+        AgentMemory memory = memorySupplier == null ? sourceContext.getMemory() : memorySupplier.get();
         AgentSessionMetadata sessionMetadata = metadata == null ? AgentSessionMetadata.create() : metadata.copy();
         AgentSessionEventLog eventLog = new InMemoryAgentSessionEventLog();
-        AgentContext sessionContext = baseContext.toBuilder()
+        AgentContext sessionContext = sourceContext.toBuilder()
                 .memory(memory)
                 .sessionId(sessionMetadata.getSessionId())
-                .eventPublisher(sessionEventPublisher(eventLog))
+                .eventPublisher(sessionEventPublisher(eventLog, sourceContext))
                 .build();
         return new AgentSession(runtime, sessionContext, sessionMetadata, eventLog, sessionStore, runId);
     }
 
     public AgentSession newSession(AgentSessionSnapshot snapshot) {
+        return newSession(snapshot, baseContext);
+    }
+
+    /**
+     * Restores a session using a per-execution context overlay. The snapshot
+     * remains the source of session state; the overlay only supplies runtime
+     * facilities such as Harness tools, listeners, and bounded options.
+     */
+    public AgentSession newSession(AgentSessionSnapshot snapshot, AgentContext context) {
         AgentSession session = newSession(
+                context == null ? baseContext : context,
                 snapshot == null ? null : snapshot.getMetadata(),
                 snapshot == null ? null : snapshot.getRunId()
         );
@@ -83,8 +160,9 @@ public class Agent {
         return sessionStore;
     }
 
-    private AgentEventPublisher sessionEventPublisher(final AgentSessionEventLog eventLog) {
-        AgentEventPublisher basePublisher = baseContext == null ? null : baseContext.getEventPublisher();
+    private AgentEventPublisher sessionEventPublisher(final AgentSessionEventLog eventLog,
+                                                       AgentContext sourceContext) {
+        AgentEventPublisher basePublisher = sourceContext == null ? null : sourceContext.getEventPublisher();
         List<AgentListener> baseListeners = basePublisher == null ? null : basePublisher.getListeners();
         AgentEventPublisher publisher = new AgentEventPublisher(baseListeners);
         publisher.addListener(new AgentListener() {
@@ -94,5 +172,18 @@ public class Agent {
             }
         });
         return publisher;
+    }
+
+    private static final class AsyncExecutorHolder {
+        private static final ExecutorService EXECUTOR = Executors.newCachedThreadPool(new ThreadFactory() {
+            private final AtomicInteger sequence = new AtomicInteger();
+
+            @Override
+            public Thread newThread(Runnable runnable) {
+                Thread thread = new Thread(runnable, "ai4j-agent-async-" + sequence.incrementAndGet());
+                thread.setDaemon(true);
+                return thread;
+            }
+        });
     }
 }

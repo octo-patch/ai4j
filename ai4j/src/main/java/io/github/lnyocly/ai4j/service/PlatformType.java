@@ -25,6 +25,9 @@ public enum PlatformType {
     DOUBAO("doubao"),
     JINA("jina"),
     SUNO("suno"),
+    GROK("grok"),
+    AGNES("agnes"),
+    TYPESAFE("typesafe"),
     ;
     private final String platform;
 

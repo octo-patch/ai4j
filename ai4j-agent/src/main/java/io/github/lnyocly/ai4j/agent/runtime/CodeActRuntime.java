@@ -3,6 +3,7 @@ package io.github.lnyocly.ai4j.agent.runtime;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
 import io.github.lnyocly.ai4j.agent.AgentContext;
+import io.github.lnyocly.ai4j.agent.AgentExecutionStatus;
 import io.github.lnyocly.ai4j.agent.AgentOptions;
 import io.github.lnyocly.ai4j.agent.AgentRequest;
 import io.github.lnyocly.ai4j.agent.AgentResult;
@@ -18,13 +19,16 @@ import io.github.lnyocly.ai4j.agent.model.AgentModelResult;
 import io.github.lnyocly.ai4j.agent.model.AgentPrompt;
 import io.github.lnyocly.ai4j.agent.skill.AgentSkillRuntimeSupport;
 import io.github.lnyocly.ai4j.agent.tool.AgentToolCall;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolExecutionStatus;
 import io.github.lnyocly.ai4j.agent.tool.AgentToolResult;
 import io.github.lnyocly.ai4j.agent.util.AgentInputItem;
 import io.github.lnyocly.ai4j.extension.lifecycle.AgentLifecycleEventType;
 import io.github.lnyocly.ai4j.platform.openai.tool.Tool;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 public class CodeActRuntime extends BaseAgentRuntime {
@@ -38,12 +42,22 @@ public class CodeActRuntime extends BaseAgentRuntime {
 
     @Override
     public AgentResult run(AgentContext context, AgentRequest request) throws Exception {
-        return runInternal(context, request, null);
+        beginRun();
+        try {
+            return runInternal(context, request, null);
+        } finally {
+            finishRun();
+        }
     }
 
     @Override
     public void runStream(AgentContext context, AgentRequest request, AgentListener listener) throws Exception {
-        runInternal(context, request, listener);
+        beginRun();
+        try {
+            runInternal(context, request, listener);
+        } finally {
+            finishRun();
+        }
     }
 
     protected AgentResult runInternal(AgentContext context, AgentRequest request, AgentListener listener) throws Exception {
@@ -54,7 +68,7 @@ public class CodeActRuntime extends BaseAgentRuntime {
         boolean reAct = codeActOptions != null && codeActOptions.isReAct();
         String sessionId = request == null ? null : trimToNull(request.getMetadataString(AgentRequest.METADATA_KEY_SESSION_ID));
         if (sessionId == null) {
-            sessionId = context == null ? null : trimToNull(context.getSessionId());
+            sessionId = trimToNull(context.getSessionId());
         }
         String runId = request == null ? null : trimToNull(request.getMetadataString(AgentRequest.METADATA_KEY_RUN_ID));
         if (runId == null) {
@@ -71,6 +85,7 @@ public class CodeActRuntime extends BaseAgentRuntime {
         }
         if (request != null && request.getInput() != null) {
             memory.addUserInput(request.getInput());
+            publish(context, listener, AgentEventType.USER_INPUT, 0, null, request.getInput(), runId, sessionId, turnId);
         }
 
         CodeExecutor codeExecutor = context.getCodeExecutor();
@@ -87,6 +102,7 @@ public class CodeActRuntime extends BaseAgentRuntime {
         int step = 0;
         boolean stepLimited = maxSteps > 0;
         while (!stepLimited || step < maxSteps) {
+            throwIfCancelled();
             publish(context, listener, AgentEventType.STEP_START, step, runtimeName(), null, runId, sessionId, turnId);
             dispatchLifecycle(context, AgentLifecycleEventType.BEFORE_TURN, step, runtimeName(), null);
 
@@ -97,14 +113,18 @@ public class CodeActRuntime extends BaseAgentRuntime {
 
             if (modelResult != null && modelResult.getMemoryItems() != null) {
                 memory.addOutputItems(modelResult.getMemoryItems());
+                publish(context, listener, AgentEventType.MEMORY_ITEMS_APPENDED, step, null,
+                        modelResult.getMemoryItems(), runId, sessionId, turnId);
             }
 
             String output = modelResult == null ? null : modelResult.getOutputText();
             CodeActMessage message = parseMessage(output);
             if (reAct && finalizeRequested && message != null && "code".equals(message.type)) {
-                memory.addOutputItems(java.util.Collections.singletonList(
+                List<Object> finalizeItems = java.util.Collections.singletonList(
                         AgentInputItem.systemMessage("FINALIZE_MODE: Do not output code. Use the latest CODE_RESULT to respond with {\"type\":\"final\",\"output\":\"...\"}.")
-                ));
+                );
+                memory.addOutputItems(finalizeItems);
+                publish(context, listener, AgentEventType.MEMORY_ITEMS_APPENDED, step, null, finalizeItems, runId, sessionId, turnId);
                 dispatchLifecycle(context, AgentLifecycleEventType.AFTER_TURN, step, runtimeName(), modelResult);
                 publish(context, listener, AgentEventType.STEP_END, step, runtimeName(), null, runId, sessionId, turnId);
                 step += 1;
@@ -123,7 +143,8 @@ public class CodeActRuntime extends BaseAgentRuntime {
                         .rawResponse(modelResult == null ? null : modelResult.getRawResponse())
                         .toolCalls(toolCalls)
                         .toolResults(toolResults)
-                        .steps(step + 1), context).build();
+                        .steps(step + 1)
+                        .executionStatus(AgentExecutionStatus.COMPLETED), context).build();
             }
 
             if (!"code".equals(message.type) || message.code == null) {
@@ -138,7 +159,8 @@ public class CodeActRuntime extends BaseAgentRuntime {
                         .rawResponse(modelResult == null ? null : modelResult.getRawResponse())
                         .toolCalls(toolCalls)
                         .toolResults(toolResults)
-                        .steps(step + 1), context).build();
+                        .steps(step + 1)
+                        .executionStatus(AgentExecutionStatus.COMPLETED), context).build();
             }
 
             AgentToolCall toolCall = AgentToolCall.builder()
@@ -155,25 +177,45 @@ public class CodeActRuntime extends BaseAgentRuntime {
                 execResult = codeExecutor.execute(CodeExecutionRequest.builder()
                         .language(message.language)
                         .code(message.code)
-                        .toolNames(extractToolNames(context.getToolRegistry() == null ? null : context.getToolRegistry().getTools()))
+                        .toolNames(extractToolNames(visibleTools(context)))
                         .toolExecutor(context.getToolExecutor())
                         .user(context.getUser())
+                        .parentCallId(toolCall.getCallId())
                         .build());
             } finally {
                 dispatchLifecycle(context, AgentLifecycleEventType.AFTER_TOOL_CALL, step, toolCall.getName(), toolCall);
             }
 
             String toolOutput = buildToolOutput(execResult);
-            toolResults.add(AgentToolResult.builder()
-                    .name("code")
-                    .callId(toolCall.getCallId())
-                    .output(toolOutput)
-                    .build());
+            AgentToolResult codeToolResult = buildCodeToolResult(toolCall, execResult, toolOutput);
+            toolResults.add(codeToolResult);
+            publish(context, listener, AgentEventType.TOOL_RESULT, step, toolOutput, codeToolResult, runId, sessionId, turnId);
+            if (execResult != null && execResult.isWaiting()) {
+                List<Object> pendingItems = java.util.Collections.singletonList(
+                        AgentInputItem.systemMessage(pendingMarker(toolCall, toolOutput)));
+                memory.addOutputItems(pendingItems);
+                publish(context, listener, AgentEventType.MEMORY_ITEMS_APPENDED, step, null, pendingItems, runId, sessionId, turnId);
+                dispatchLifecycle(context, AgentLifecycleEventType.AFTER_TURN, step, runtimeName(), modelResult);
+                publish(context, listener, AgentEventType.STEP_END, step, runtimeName(), null, runId, sessionId, turnId);
+                return usage.applyTo(AgentResult.builder()
+                        .runId(runId)
+                        .sessionId(sessionId)
+                        .turnId(turnId)
+                        .outputText(output == null ? "" : output)
+                        .rawResponse(modelResult == null ? null : modelResult.getRawResponse())
+                        .toolCalls(toolCalls)
+                        .toolResults(toolResults)
+                        .steps(step + 1)
+                        .executionStatus(AgentExecutionStatus.WAITING)
+                        .operationId(execResult.getOperationId())
+                        .waitId(execResult.getWaitId()), context).build();
+            }
             String toolMessage = (execResult != null && execResult.isSuccess())
                     ? "CODE_RESULT: " + toolOutput
                     : "CODE_ERROR: " + toolOutput;
-            memory.addOutputItems(java.util.Collections.singletonList(AgentInputItem.systemMessage(toolMessage)));
-            publish(context, listener, AgentEventType.TOOL_RESULT, step, toolOutput, execResult, runId, sessionId, turnId);
+            List<Object> toolMessageItems = java.util.Collections.singletonList(AgentInputItem.systemMessage(toolMessage));
+            memory.addOutputItems(toolMessageItems);
+            publish(context, listener, AgentEventType.MEMORY_ITEMS_APPENDED, step, null, toolMessageItems, runId, sessionId, turnId);
             if (reAct) {
                 finalizeRequested = execResult != null && execResult.isSuccess();
             }
@@ -193,7 +235,8 @@ public class CodeActRuntime extends BaseAgentRuntime {
                         .rawResponse(modelResult == null ? null : modelResult.getRawResponse())
                         .toolCalls(toolCalls)
                         .toolResults(toolResults)
-                        .steps(step + 1), context).build();
+                        .steps(step + 1)
+                        .executionStatus(AgentExecutionStatus.COMPLETED), context).build();
             }
 
             dispatchLifecycle(context, AgentLifecycleEventType.AFTER_TURN, step, runtimeName(), modelResult);
@@ -210,12 +253,20 @@ public class CodeActRuntime extends BaseAgentRuntime {
                 .rawResponse(lastResult == null ? null : lastResult.getRawResponse())
                 .toolCalls(toolCalls)
                 .toolResults(toolResults)
-                .steps(step), context).build();
+                .steps(step)
+                .executionStatus(AgentExecutionStatus.CONTINUATION_REQUIRED), context).build();
+    }
+
+    private String pendingMarker(AgentToolCall call, String toolOutput) {
+        Map<String, Object> marker = new LinkedHashMap<String, Object>();
+        marker.put("callId", call == null ? null : call.getCallId());
+        marker.put("output", toolOutput);
+        return AgentToolCall.CODEACT_PENDING_RESULT_PREFIX + " " + JSON.toJSONString(marker);
     }
 
     @Override
     protected AgentPrompt buildPrompt(AgentContext context, AgentMemory memory, boolean stream) {
-        return buildPrompt(context, memory, stream, 0, null, null, context == null ? null : context.getSessionId(), null);
+        return buildPrompt(context, memory, stream, 0, null, null, context.getSessionId(), null);
     }
 
     @Override
@@ -224,7 +275,7 @@ public class CodeActRuntime extends BaseAgentRuntime {
                                       boolean stream,
                                       int step,
                                       AgentListener listener) {
-        return buildPrompt(context, memory, stream, step, listener, null, context == null ? null : context.getSessionId(), null);
+        return buildPrompt(context, memory, stream, step, listener, null, context.getSessionId(), null);
     }
 
     @Override
@@ -282,7 +333,7 @@ public class CodeActRuntime extends BaseAgentRuntime {
                     .append("or use callTool(\"toolName\", args). ")
                     .append("If you see a CODE_RESULT message, use it to respond with type=final unless more tools are required. ");
         }
-        List<Object> tools = context.getToolRegistry() == null ? null : context.getToolRegistry().getTools();
+        List<Object> tools = visibleTools(context);
         String toolGuide = buildToolGuide(tools);
         if (!toolGuide.isEmpty()) {
             builder.append("Available tools: ").append(toolGuide);
@@ -428,7 +479,35 @@ public class CodeActRuntime extends BaseAgentRuntime {
         if (result.getError() != null && !result.getError().isEmpty()) {
             obj.put("error", result.getError());
         }
+        if (result.getStatus() != null && result.getStatus() != AgentToolExecutionStatus.COMPLETED) {
+            obj.put("status", result.getStatus().name());
+        }
+        if (result.getOperationId() != null) {
+            obj.put("operationId", result.getOperationId());
+        }
+        if (result.getWaitId() != null) {
+            obj.put("waitId", result.getWaitId());
+        }
         return obj.toJSONString();
+    }
+
+    private AgentToolResult buildCodeToolResult(AgentToolCall call,
+                                                CodeExecutionResult result,
+                                                String output) {
+        AgentToolExecutionStatus status = result == null || result.getStatus() == null
+                ? (result != null && result.isSuccess()
+                ? AgentToolExecutionStatus.COMPLETED : AgentToolExecutionStatus.FAILED)
+                : result.getStatus();
+        return AgentToolResult.builder()
+                .name(call == null ? "code" : call.getName())
+                .callId(call == null ? null : call.getCallId())
+                .output(output)
+                .status(status)
+                .ok(AgentToolExecutionStatus.FAILED.equals(status) ? Boolean.FALSE : null)
+                .error(result == null ? "code execution returned no result" : result.getError())
+                .operationId(result == null ? null : result.getOperationId())
+                .waitId(result == null ? null : result.getWaitId())
+                .build();
     }
 
     private String resolveDirectOutput(CodeExecutionResult result) {

@@ -74,6 +74,59 @@ public class CodingAgentLoopControllerTest {
     }
 
     @Test
+    public void codingLoopDefaults_areUnlimited() {
+        CodingAgentOptions options = CodingAgentOptions.builder().build();
+        CodingLoopPolicy policy = CodingLoopPolicy.from(options);
+
+        assertEquals(0, options.getMaxAutoFollowUps());
+        assertEquals(0, options.getMaxTotalTurns());
+        assertEquals(0, policy.getMaxAutoFollowUps());
+        assertEquals(0, policy.getMaxTotalTurns());
+    }
+
+    @Test
+    public void codingLoopDefault_allowsMoreThanSixTurns() throws Exception {
+        InspectableQueueModelClient modelClient = new InspectableQueueModelClient();
+        for (int i = 0; i < 7; i++) {
+            modelClient.enqueue(assistantResult("Continuing with remaining work."));
+        }
+        modelClient.enqueue(assistantResult("Completed the requested change."));
+
+        CodingAgentOptions options = CodingAgentOptions.builder()
+                .autoCompactEnabled(false)
+                .autoContinueEnabled(true)
+                .build();
+
+        try (CodingSession session = newAgent(modelClient, okToolExecutor(), options).newSession()) {
+            CodingAgentResult result = session.run("Keep working until the task is done.");
+
+            assertEquals(CodingStopReason.COMPLETED, result.getStopReason());
+            assertEquals(8, result.getTurns());
+            assertEquals(7, result.getAutoFollowUpCount());
+            assertTrue(result.isAutoContinued());
+        }
+    }
+
+    @Test
+    public void shouldAutoContinueAfterRuntimeStepBudget() throws Exception {
+        InspectableQueueModelClient modelClient = new InspectableQueueModelClient();
+        modelClient.enqueue(toolCallResult(STUB_TOOL, "budget-call"));
+        modelClient.enqueue(assistantResult("Completed the requested change.", 1L, 1L));
+        CodingAgent agent = CodingAgents.builder()
+                .modelClient(modelClient).model("test")
+                .workspaceContext(WorkspaceContext.builder().rootPath(temporaryFolder.newFolder().toString()).build())
+                .codingOptions(defaultOptions())
+                .agentOptions(io.github.lnyocly.ai4j.agent.AgentOptions.builder().maxSteps(1).build())
+                .toolRegistry(singleToolRegistry(STUB_TOOL)).toolExecutor(okToolExecutor()).build();
+        try (CodingSession session = agent.newSession()) {
+            CodingAgentResult result = session.run("Implement the requested change.");
+            assertEquals(CodingStopReason.COMPLETED, result.getStopReason());
+            assertEquals(2, result.getTurns());
+            assertTrue(result.isAutoContinued());
+        }
+    }
+
+    @Test
     public void shouldKeepLegacyCodingAgentResultConstructor() {
         CodingAgentResult result = new CodingAgentResult(
                 "run", "session", "turn", "output", null, null, null,
@@ -194,6 +247,30 @@ public class CodingAgentLoopControllerTest {
             assertEquals(CodingLoopDecision.CONTINUE_AFTER_TOOL_WORK, decisions.get(0).getContinueReason());
             assertFalse(decisions.get(1).isContinueLoop());
             assertEquals(CodingStopReason.MAX_AUTO_FOLLOWUPS_REACHED, decisions.get(1).getStopReason());
+        }
+    }
+
+    @Test
+    public void shouldStopWhenMaxTotalTurnsIsReached() throws Exception {
+        InspectableQueueModelClient modelClient = new InspectableQueueModelClient();
+        modelClient.enqueue(assistantResult("Continuing with remaining work."));
+        modelClient.enqueue(assistantResult("Continuing with remaining work."));
+        modelClient.enqueue(assistantResult("Continuing with remaining work."));
+
+        CodingAgentOptions options = CodingAgentOptions.builder()
+                .autoCompactEnabled(false)
+                .autoContinueEnabled(true)
+                .maxAutoFollowUps(0)
+                .maxTotalTurns(2)
+                .build();
+
+        try (CodingSession session = newAgent(modelClient, okToolExecutor(), options).newSession()) {
+            CodingAgentResult result = session.run("Keep working until the task is done.");
+
+            assertEquals(CodingStopReason.MAX_TOTAL_TURNS_REACHED, result.getStopReason());
+            assertEquals(2, result.getTurns());
+            assertEquals(1, result.getAutoFollowUpCount());
+            assertTrue(result.isAutoContinued());
         }
     }
 

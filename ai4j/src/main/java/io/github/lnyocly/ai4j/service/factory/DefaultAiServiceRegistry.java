@@ -16,6 +16,7 @@ import io.github.lnyocly.ai4j.config.MoonshotConfig;
 import io.github.lnyocly.ai4j.config.OllamaConfig;
 import io.github.lnyocly.ai4j.config.OpenAiConfig;
 import io.github.lnyocly.ai4j.config.SunoConfig;
+import io.github.lnyocly.ai4j.config.TypeSafeConfig;
 import io.github.lnyocly.ai4j.config.ZhipuConfig;
 import io.github.lnyocly.ai4j.service.AiConfig;
 import io.github.lnyocly.ai4j.service.Configuration;
@@ -62,7 +63,8 @@ public class DefaultAiServiceRegistry implements AiServiceRegistry {
                 throw new IllegalArgumentException("Ai platform id must not be blank");
             }
             PlatformType platformType = resolvePlatformType(aiPlatform.getPlatform(), id);
-            Configuration scopedConfiguration = createScopedConfiguration(configuration, aiPlatform, platformType);
+            Configuration scopedConfiguration = createScopedConfiguration(
+                    configuration, resolveApiKeyEnv(aiPlatform), platformType);
             registrations.put(id, new AiServiceRegistration(id, platformType, aiServiceFactory.create(scopedConfiguration)));
         }
         return new DefaultAiServiceRegistry(registrations);
@@ -83,6 +85,30 @@ public class DefaultAiServiceRegistry implements AiServiceRegistry {
         BeanUtil.copyProperties(source, target, CopyOptions.create());
         applyPlatformConfig(target, aiPlatform, platformType);
         return target;
+    }
+
+    /**
+     * Resolves a declared {@code apiKeyEnv} reference. When set, the environment
+     * variable wins over the plaintext {@code apiKey} field; the caller's
+     * {@link AiPlatform} is left untouched and a resolved copy is returned.
+     * The error names the variable and platform id — never the secret value.
+     */
+    private static AiPlatform resolveApiKeyEnv(AiPlatform aiPlatform) {
+        String envName = aiPlatform.getApiKeyEnv();
+        if (envName == null || "".equals(envName.trim())) {
+            return aiPlatform;
+        }
+        String variable = envName.trim();
+        String resolved = System.getenv(variable);
+        if (resolved == null || "".equals(resolved.trim())) {
+            throw new IllegalStateException("Ai platform '" + aiPlatform.getId()
+                    + "' declares apiKeyEnv '" + variable
+                    + "' but the environment variable is not set or empty");
+        }
+        AiPlatform copy = new AiPlatform();
+        BeanUtil.copyProperties(aiPlatform, copy, CopyOptions.create());
+        copy.setApiKey(resolved);
+        return copy;
     }
 
     private static PlatformType resolvePlatformType(String rawPlatform, String id) {
@@ -139,6 +165,9 @@ public class DefaultAiServiceRegistry implements AiServiceRegistry {
                 break;
             case SUNO:
                 target.setSunoConfig(copy(aiPlatform, SunoConfig.class));
+                break;
+            case TYPESAFE:
+                target.setTypeSafeConfig(copy(aiPlatform, TypeSafeConfig.class));
                 break;
             default:
                 throw new IllegalArgumentException("Unsupported platform type: " + platformType);

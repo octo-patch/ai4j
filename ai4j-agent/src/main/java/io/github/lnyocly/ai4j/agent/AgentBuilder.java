@@ -15,6 +15,7 @@ import io.github.lnyocly.ai4j.agent.dynamicworkflow.DynamicWorkflowRuntimeOption
 import io.github.lnyocly.ai4j.agent.dynamicworkflow.NashornDynamicWorkflowExecutor;
 import io.github.lnyocly.ai4j.agent.event.AgentEventPublisher;
 import io.github.lnyocly.ai4j.agent.extension.ExtensionAgentTools;
+import io.github.lnyocly.ai4j.agent.extension.ExtensionInterceptors;
 import io.github.lnyocly.ai4j.agent.extension.ExtensionGuardrailToolExecutor;
 import io.github.lnyocly.ai4j.agent.lifecycle.AgentLifecycleHookDispatcher;
 import io.github.lnyocly.ai4j.extension.lifecycle.AgentLifecycleHook;
@@ -33,6 +34,7 @@ import io.github.lnyocly.ai4j.agent.subagent.HandoffPolicy;
 import io.github.lnyocly.ai4j.agent.subagent.SubAgentRegistry;
 import io.github.lnyocly.ai4j.agent.subagent.SubAgentToolExecutor;
 import io.github.lnyocly.ai4j.agent.tool.AgentToolRegistry;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolVisibility;
 import io.github.lnyocly.ai4j.agent.tool.CompositeToolRegistry;
 import io.github.lnyocly.ai4j.agent.tool.RoutingToolExecutor;
 import io.github.lnyocly.ai4j.agent.tool.StaticToolRegistry;
@@ -57,13 +59,13 @@ import io.github.lnyocly.ai4j.agent.trace.TraceExporter;
 import io.github.lnyocly.ai4j.agent.trace.TracePricingResolver;
 import io.github.lnyocly.ai4j.extension.ExtensionRegistry;
 import io.github.lnyocly.ai4j.extension.guardrail.ExtensionGuardrail;
-import io.github.lnyocly.ai4j.platform.openai.tool.Tool;
 import okhttp3.OkHttpClient;
 
 import java.lang.reflect.Constructor;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -83,6 +85,7 @@ public class AgentBuilder {
     private AgentRuntime runtime;
     private AgentModelClient modelClient;
     private AgentToolRegistry toolRegistry;
+    private AgentToolVisibility toolVisibility;
     private ExtensionAgentTools extensionTools;
     private SubAgentRegistry subAgentRegistry;
     private HandoffPolicy handoffPolicy;
@@ -121,6 +124,8 @@ public class AgentBuilder {
     private Object reasoning;
     private Object toolChoice;
     private Boolean parallelToolCalls;
+    private Integer maxParallelToolCalls;
+    private Long toolCallTimeoutMillis;
     private Boolean store;
     private String user;
     private Map<String, Object> extraBody;
@@ -237,6 +242,22 @@ public class AgentBuilder {
 
     public AgentBuilder toolRegistry(AgentToolRegistry toolRegistry) {
         this.toolRegistry = toolRegistry;
+        return this;
+    }
+
+    /**
+     * Sets the model-facing tool view without changing host-side execution or
+     * permission routing. A null value preserves the historical all-tools
+     * behavior.
+     */
+    public AgentBuilder toolVisibility(AgentToolVisibility toolVisibility) {
+        this.toolVisibility = toolVisibility;
+        return this;
+    }
+
+    /** Convenience form for exposing only the named registered tools. */
+    public AgentBuilder visibleToolNames(Collection<String> names) {
+        this.toolVisibility = AgentToolVisibility.named(names);
         return this;
     }
 
@@ -521,6 +542,25 @@ public class AgentBuilder {
         return this;
     }
 
+    /**
+     * Caps how many tool calls execute concurrently when {@link #parallelToolCalls} dispatch is on.
+     * Null or {@code <= 0} leaves the batch unbounded (one thread per call).
+     */
+    public AgentBuilder maxParallelToolCalls(Integer maxParallelToolCalls) {
+        this.maxParallelToolCalls = maxParallelToolCalls;
+        return this;
+    }
+
+    /**
+     * Per-call timeout for parallel tool dispatch, in milliseconds. A call that exceeds the budget
+     * is cancelled and recorded as a FAILED tool result; sibling calls still complete normally.
+     * Null or {@code <= 0} disables the timeout.
+     */
+    public AgentBuilder toolCallTimeoutMillis(Long toolCallTimeoutMillis) {
+        this.toolCallTimeoutMillis = toolCallTimeoutMillis;
+        return this;
+    }
+
     public AgentBuilder store(Boolean store) {
         this.store = store;
         return this;
@@ -598,16 +638,26 @@ public class AgentBuilder {
         AgentLifecycleHookDispatcher lifecycleHooks = mergedHooks.isEmpty()
                 ? AgentLifecycleHookDispatcher.empty()
                 : new AgentLifecycleHookDispatcher(mergedHooks);
+        ToolInterceptor resolvedToolInterceptor = ExtensionInterceptors.composeToolCall(
+                toolInterceptor,
+                extensionTools == null ? null : extensionTools.getToolCallInterceptors());
+        PromptInterceptor resolvedPromptInterceptor = ExtensionInterceptors.composePrompt(
+                promptInterceptor,
+                extensionTools == null ? null : extensionTools.getPromptInterceptors());
+        ModelRequestHook resolvedModelRequestHook = ExtensionInterceptors.composeModelRequest(
+                modelRequestHook,
+                extensionTools == null ? null : extensionTools.getModelRequestInterceptors());
 
         AgentContext context = AgentContext.builder()
                 .modelClient(modelClient)
                 .toolRegistry(resolvedToolRegistry)
+                .toolVisibility(toolVisibility)
                 .toolExecutor(resolvedToolExecutor)
-                .toolInterceptor(toolInterceptor)
-                .promptInterceptor(promptInterceptor)
+                .toolInterceptor(resolvedToolInterceptor)
+                .promptInterceptor(resolvedPromptInterceptor)
                 .sandboxProvider(sandboxProvider)
                 .compactPolicy(compactPolicy)
-                .modelRequestHook(modelRequestHook)
+                .modelRequestHook(resolvedModelRequestHook)
                 .codeExecutor(resolvedCodeExecutor)
                 .memory(memory)
                 .options(resolvedOptions)
@@ -627,6 +677,8 @@ public class AgentBuilder {
                 .reasoning(reasoning)
                 .toolChoice(toolChoice)
                 .parallelToolCalls(parallelToolCalls)
+                .maxParallelToolCalls(maxParallelToolCalls)
+                .toolCallTimeoutMillis(toolCallTimeoutMillis)
                 .store(store)
                 .user(user)
                 .extraBody(extraBody)
@@ -644,7 +696,20 @@ public class AgentBuilder {
         if ("1.8".equals(javaSpecVersion) || "8".equals(javaSpecVersion)) {
             return new NashornCodeExecutor();
         }
-        return new GraalVmCodeExecutor();
+        if (isGraalPolyglotAvailable()) {
+            return new GraalVmCodeExecutor();
+        }
+        return new NashornCodeExecutor();
+    }
+
+    /** graal-sdk is an optional dependency of ai4j-agent; fall back to Nashorn when it is absent. */
+    private boolean isGraalPolyglotAvailable() {
+        try {
+            Class.forName("org.graalvm.polyglot.Context");
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
     private SubAgentRegistry resolveSubAgentRegistry() {
         if (subAgentRegistry != null) {
@@ -673,11 +738,9 @@ public class AgentBuilder {
             return names;
         }
         for (Object tool : tools) {
-            if (tool instanceof Tool) {
-                Tool.Function fn = ((Tool) tool).getFunction();
-                if (fn != null && fn.getName() != null) {
-                    names.add(fn.getName());
-                }
+            String name = AgentToolVisibility.toolName(tool);
+            if (name != null) {
+                names.add(name);
             }
         }
         return names;

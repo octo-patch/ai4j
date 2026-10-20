@@ -2,6 +2,8 @@ package io.github.lnyocly.ai4j.websearch;
 
 import com.alibaba.fastjson2.JSON;
 import io.github.lnyocly.ai4j.exception.CommonException;
+import io.github.lnyocly.ai4j.exception.Ai4jException;
+import io.github.lnyocly.ai4j.exception.HttpErrorDecoder;
 import io.github.lnyocly.ai4j.listener.SseListener;
 import io.github.lnyocly.ai4j.platform.openai.chat.entity.ChatCompletion;
 import io.github.lnyocly.ai4j.platform.openai.chat.entity.ChatCompletionResponse;
@@ -10,12 +12,14 @@ import io.github.lnyocly.ai4j.service.Configuration;
 import io.github.lnyocly.ai4j.service.IChatService;
 import io.github.lnyocly.ai4j.network.UrlUtils;
 import io.github.lnyocly.ai4j.websearch.searxng.SearXNGConfig;
-import io.github.lnyocly.ai4j.websearch.searxng.SearXNGRequest;
 import io.github.lnyocly.ai4j.websearch.searxng.SearXNGResponse;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
+import okhttp3.ResponseBody;
 import org.apache.commons.lang3.StringUtils;
+
+import java.util.List;
 
 /**
  * @Author cly
@@ -72,12 +76,6 @@ public class ChatWithWebSearchEnhance implements IChatService {
 
     private String performWebSearch(String query) {
 
-        SearXNGRequest searXNGRequest = SearXNGRequest.builder()
-                .q(query)
-                .engines(searXNGConfig.getEngines())
-                .build();
-
-
         if(StringUtils.isBlank(searXNGConfig.getUrl())){
             throw new CommonException("SearXNG url is not configured");
         }
@@ -90,22 +88,29 @@ public class ChatWithWebSearchEnhance implements IChatService {
 
 
         try(Response execute = okHttpClient.newCall(request).execute()) {
-            if (execute.isSuccessful() && execute.body() != null){
-                SearXNGResponse searXNGResponse = JSON.parseObject(execute.body().string(), SearXNGResponse.class);
+            ResponseBody body = execute.body();
+            if (execute.isSuccessful() && body != null){
+                SearXNGResponse searXNGResponse = JSON.parseObject(body.string(), SearXNGResponse.class);
+                List<SearXNGResponse.Result> results = searXNGResponse == null ? null : searXNGResponse.getResults();
 
-                if(searXNGResponse.getResults().size() > searXNGConfig.getNums()) {
-                    return JSON.toJSONString(searXNGResponse.getResults().subList(0, searXNGConfig.getNums()));
+                if (results == null || results.isEmpty()) {
+                    return "[]";
                 }
-                return JSON.toJSONString(searXNGResponse.getResults());
+                if(results.size() > searXNGConfig.getNums()) {
+                    return JSON.toJSONString(results.subList(0, searXNGConfig.getNums()));
+                }
+                return JSON.toJSONString(results);
 
 
             }else{
-                throw new CommonException("SearXNG request failed");
+                throw HttpErrorDecoder.decode(execute);
             }
 
 
+        } catch (Ai4jException e) {
+            throw e;
         } catch (Exception e) {
-            throw new CommonException("SearXNG request failed");
+            throw new CommonException("SearXNG request failed: " + e.getMessage());
         }
 
 

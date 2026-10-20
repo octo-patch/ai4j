@@ -1,5 +1,10 @@
-# Tools and Registry
+---
+title: 工具与注册表
+description: 拆解 ai4j-agent 工具体系：AgentToolRegistry 只管暴露面、ToolExecutor 管执行与权限边界，runtime 如何归一化、校验、执行工具并把结果回灌 memory，以及审批拦截该放哪层。
+tags: [concept]
+---
 
+# 工具与注册表
 在 `ai4j-agent` 里，工具体系真正解决的不是“函数怎么暴露给模型”，而是四个边界如何拆开：
 
 - 模型能看见什么工具
@@ -124,8 +129,10 @@ RagTool ragTool = RagTool.builder(ragService)
         .build();
 ```
 
+:::warning 租户 filter 必须固定在服务端
 这样 LLM 只负责提出检索 query，真正的租户边界由服务端执行器写入 `RagQuery.filter`。
 这和普通工具权限一样，属于执行边界，不属于模型可协商的参数。
+:::
 
 ## 4. 默认 Builder 装配路径比看起来更具体
 
@@ -322,6 +329,25 @@ ToolExecutor guarded = call -> {
 
 如果执行器内部复用可变状态、共享临时文件或依赖单线程顺序，那么一开并行就会出问题。这个问题通常不是模型层报错，而是工具层 race condition。
 
+### 8.1 并发上限与单调用超时
+
+并行派发由两个可选旋钮控制（Blueprint `$.model.options` 同名可用，也接受 `max_parallel_tool_calls` / `tool_call_timeout_millis` 蛇形键）：
+
+```java
+Agent agent = Agents.react()
+        .modelClient(modelClient)
+        .model("gpt-4.1")
+        .parallelToolCalls(true)
+        .maxParallelToolCalls(4)        // 同一轮最多并发 4 个工具执行
+        .toolCallTimeoutMillis(30_000L) // 单个工具 30s 未返回即记为 FAILED
+        .build();
+```
+
+- `maxParallelToolCalls`：每轮并发池大小收紧为 `min(本轮 call 数, cap)`；`null` 或 `<= 0` 保持历史行为（每个 call 一个线程）。
+- `toolCallTimeoutMillis`：超时 call 被 `cancel(true)` 中断并记录为 `FAILED` 结果（`ok=false`，output 为 `TOOL_ERROR` JSON），**不影响同批其它 call**——与工具自身抛异常的语义一致。`null` 或 `<= 0` 不启用。
+- 结果仍按模型返回的 call 顺序写回 memory，事件契约顺序不变。
+- 派发池 worker 是 daemon 线程（`ai4j-tool-exec-N`），不会阻止 JVM 退出。
+
 ## 9. 典型接入方式
 
 ### 9.1 用 `ToolUtil` + MCP 快速拼出统一工具面
@@ -416,8 +442,8 @@ Agent agent = Agents.builder()
 
 ## 12. 继续阅读
 
-1. [Memory and State](/docs/agent/memory-and-state)
-2. [Minimal ReAct Agent](/docs/agent/minimal-react-agent)
-3. [Subagent Handoff Policy](/docs/agent/subagent-handoff-policy)
-4. [Agent Teams](/docs/agent/agent-teams)
-5. [Trace Observability](/docs/agent/trace-observability)
+1. [记忆与状态](/docs/agent/memory/memory-and-state)
+2. [Minimal ReAct Agent](/docs/agent/runtimes/minimal-react-agent)
+3. [Subagent Handoff Policy](/docs/agent/orchestration/subagent-handoff-policy)
+4. [Agent 团队](/docs/agent/orchestration/agent-teams)
+5. [Trace Observability](/docs/agent/observability/trace-observability)

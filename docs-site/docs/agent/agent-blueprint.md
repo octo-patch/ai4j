@@ -1,16 +1,45 @@
 ---
 sidebar_position: 9
+title: Agent 蓝图 YAML
+description: "用声明式 YAML 描述单 Agent 的模型、指令、工具、memory、compact、sandbox 与 workflow 参数，支持加载、校验与模板化，并由宿主提供依赖后创建可运行 Agent。"
+tags: [reference]
 ---
 
-# Agent Blueprint YAML
-
+# Agent 蓝图 YAML
 `AgentBlueprint` 是 `ai4j-agent` 的声明式单 Agent 配置模型。它解决的问题是：
 
 > 当 Java API 能动态组装 Agent 之后，如何让一个 Agent 的模型、指令、插件、工具、memory、compact、sandbox 开关和 workflow 参数可以被保存、分享、模板化和校验？
 
 P1-A 提供基础层：**Java DTO + YAML loader + validator + fixture tests**。P1-B 在此基础上增加 `AgentFactory`，可以在宿主显式提供 `AgentModelClient` 等依赖后把 Blueprint 转成 `AgentBuilder` / `Agent`。P1-C 进一步提供 `ai4j-cli run <agent.yaml>`，让单 Agent Blueprint 可以从终端直接运行一次。
 
-注意：`AgentFactory` 仍然不会读取 provider key、本地 profile、插件目录或真实 sandbox。它只做确定性映射，所有敏感配置和外部系统连接都由宿主应用提供。
+:::note
+`AgentFactory` 仍然不会读取 provider key、本地 profile、插件目录或真实 sandbox。它只做确定性映射，所有敏感配置和外部系统连接都由宿主应用提供。
+:::
+
+## 实现机理图（交互式）
+
+下图把声明式装配分成两段：P1-A `AgentBlueprintLoader`+`AgentBlueprintValidator` 只建模和校验 YAML（issues 带 JSONPath），不运行任何东西；P1-B `AgentFactory` 用宿主经 `AgentFactoryContext` 供给的依赖装配出 `Agent`。
+
+import useBaseUrl from '@docusaurus/useBaseUrl';
+
+<iframe
+  src={useBaseUrl('/archify/blueprint-assembly.html')}
+  title="Blueprint 声明式装配 · 交互式架构图"
+  style={{width: '100%', height: 940, border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: 8}}
+/>
+
+<a href={useBaseUrl('/archify/blueprint-assembly.html')} target="_blank" rel="noopener noreferrer">在新窗口打开全屏大图</a>（含双主题、缩放与导出功能）。
+
+**视角补充：装载-校验-装配流水线** — Loader：YAML→DTO+字段白名单 → Validator：带 JSONPath 的 ValidationReport，含 ERROR 即抛 → AgentFactory 用宿主供给上下文装配 Agent。
+
+<iframe
+  src={useBaseUrl('/archify/blueprint-load-validate-build.html')}
+  title="blueprint-load-validate-build"
+  style={{width: '100%', height: 940, border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: 8}}
+/>
+
+<a href={useBaseUrl('/archify/blueprint-load-validate-build.html')} target="_blank" rel="noopener noreferrer">在新窗口打开全屏大图</a>（含明暗双主题、缩放与导出）。
+
 
 ## 1. 适合什么场景
 
@@ -46,7 +75,9 @@ workflow:
 - 模型来自通用 `openai-compatible` provider。
 - workflow 使用 `react`，最多 3 轮。
 
-注意：这里没有 provider token。Blueprint 不负责保存密钥，密钥仍应来自环境变量、宿主配置或外部 secret store。
+:::warning
+这里没有 provider token。Blueprint 不负责保存密钥，密钥仍应来自环境变量、宿主配置或外部 secret store。
+:::
 
 ## 3. 完整一点的示例
 
@@ -450,7 +481,7 @@ P1-B 仍不直接生成 `AgentPermissionPolicy`。Factory/host 可以在后续�
 - 要求用户审批
 - 只允许在 sandbox 中执行
 
-底层策略语义见 [Agent Approval / Permission Policy](/docs/agent/approval-permission-policy)。
+底层策略语义见 [Agent 审批与权限策略](/docs/agent/governance/approval-permission-policy)。
 
 ## 10. 与 Sandbox 的关系
 
@@ -514,4 +545,6 @@ sandbox.enabled=true
 
 ### 想把 token 写进 YAML
 
+:::danger
 不要这样做。Blueprint 文件适合提交、分享和模板化；token 属于环境变量、宿主配置或 secret store。
+:::

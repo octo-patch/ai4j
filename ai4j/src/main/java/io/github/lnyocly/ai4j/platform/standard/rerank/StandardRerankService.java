@@ -3,7 +3,7 @@ package io.github.lnyocly.ai4j.platform.standard.rerank;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.lnyocly.ai4j.constant.Constants;
-import io.github.lnyocly.ai4j.exception.CommonException;
+import io.github.lnyocly.ai4j.exception.HttpErrorDecoder;
 import io.github.lnyocly.ai4j.network.UrlUtils;
 import io.github.lnyocly.ai4j.rerank.entity.RerankDocument;
 import io.github.lnyocly.ai4j.rerank.entity.RerankRequest;
@@ -72,8 +72,8 @@ public class StandardRerankService implements IRerankService {
                 JsonNode root = objectMapper.readTree(response.body().string());
                 return toResponse(root, request);
             }
+            throw HttpErrorDecoder.decode(response);
         }
-        throw new CommonException("Standard rerank request failed");
     }
 
     @Override
@@ -100,8 +100,30 @@ public class StandardRerankService implements IRerankService {
                 .id(text(root, "id"))
                 .model(firstNonBlank(text(root, "model"), request == null ? null : request.getModel()))
                 .results(results)
-                .usage(parseUsage(root == null ? null : root.get("usage")))
+                .usage(parseUsage(usageNode(root)))
                 .build();
+    }
+
+    protected JsonNode usageNode(JsonNode root) {
+        if (root == null) {
+            return null;
+        }
+        JsonNode usage = root.get("usage");
+        if (usage != null && !usage.isNull()) {
+            return usage;
+        }
+        JsonNode meta = root.get("meta");
+        if (meta != null && meta.isObject()) {
+            JsonNode tokens = meta.get("tokens");
+            if (tokens != null && tokens.isObject()) {
+                return tokens;
+            }
+            JsonNode billed = meta.get("billed_units");
+            if (billed != null && billed.isObject()) {
+                return billed;
+            }
+        }
+        return null;
     }
 
     protected RerankUsage parseUsage(JsonNode usageNode) {

@@ -5,6 +5,11 @@ import com.alibaba.fastjson2.JSONObject;
 import io.github.lnyocly.ai4j.agent.event.AgentEventType;
 import io.github.lnyocly.ai4j.agent.runtime.AgentToolExecutionScope;
 import io.github.lnyocly.ai4j.agent.tool.AgentToolCall;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolExecution;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolExecutionStatus;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolResult;
+import io.github.lnyocly.ai4j.agent.tool.AsyncToolExecutor;
+import io.github.lnyocly.ai4j.agent.tool.AsyncToolExecutors;
 import io.github.lnyocly.ai4j.agent.tool.ToolExecutor;
 
 import java.util.LinkedHashMap;
@@ -23,7 +28,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class SubAgentToolExecutor implements ToolExecutor {
+public class SubAgentToolExecutor implements AsyncToolExecutor {
 
     private static final AtomicInteger HANDOFF_THREAD_INDEX = new AtomicInteger(1);
     private static final ExecutorService HANDOFF_EXECUTOR = Executors.newCachedThreadPool(new ThreadFactory() {
@@ -66,6 +71,34 @@ public class SubAgentToolExecutor implements ToolExecutor {
             throw new IllegalStateException("toolExecutor is required for non-subagent tool: " + toolName);
         }
         return delegate.execute(call);
+    }
+
+    /**
+     * Sub-agent registry calls are currently synchronous, so their existing
+     * handoff behavior remains unchanged. A non-subagent delegate may already
+     * expose a pending operation; preserve that state instead of forcing the
+     * delegate through its blocking compatibility method.
+     */
+    @Override
+    public AgentToolExecution start(AgentToolCall call) throws Exception {
+        if (call == null) {
+            return AgentToolExecution.completed(AgentToolResult.builder()
+                    .status(AgentToolExecutionStatus.COMPLETED)
+                    .build());
+        }
+        String toolName = call.getName();
+        if (subAgentRegistry != null && subAgentRegistry.supports(toolName)) {
+            return AgentToolExecution.completed(AgentToolResult.builder()
+                    .name(toolName)
+                    .callId(call.getCallId())
+                    .output(execute(call))
+                    .status(AgentToolExecutionStatus.COMPLETED)
+                    .build());
+        }
+        if (delegate == null) {
+            throw new IllegalStateException("toolExecutor is required for non-subagent tool: " + toolName);
+        }
+        return AsyncToolExecutors.start(delegate, call);
     }
 
     private String executeSubAgent(AgentToolCall call, String toolName) throws Exception {
@@ -185,6 +218,36 @@ public class SubAgentToolExecutor implements ToolExecutor {
         return filtered == null ? call : filtered;
     }
 
+    /**
+     * Runs the FALLBACK_TO_PRIMARY path against the delegate executor.
+     *
+     * <p>Under real {@code AgentBuilder} wiring the delegate is a {@code ToolUtilExecutor}
+     * whose allowed-tool set was captured before subagents were merged, so it cannot serve
+     * the subagent tool name and raises an {@link IllegalArgumentException} ("Tool not
+     * allowed" / "No tool executor found"). That is not a real failure of the primary
+     * handler — it just means no primary handler exists for this tool. We translate it into
+     * a {@link PrimaryFallbackUnavailableException} so the caller surfaces a clean,
+     * intentional "handoff unavailable" message rather than the internal routing error.
+     */
+    private String executePrimaryFallback(AgentToolCall call) throws Exception {
+        try {
+            return delegate.execute(call);
+        } catch (IllegalArgumentException routingError) {
+            String message = "Handoff to subagent tool " + call.getName()
+                    + " was denied and no primary tool executor is available to serve it: "
+                    + safeMessage(routingError);
+            throw new PrimaryFallbackUnavailableException(message, routingError);
+        }
+    }
+
+    /** Signals that FALLBACK_TO_PRIMARY had no executor able to serve the subagent tool. */
+    static final class PrimaryFallbackUnavailableException extends Exception {
+        private static final long serialVersionUID = 1L;
+        PrimaryFallbackUnavailableException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
     private String executeOnce(AgentToolCall call, int depth, String toolName) throws Exception {
         long timeoutMillis = policy.getTimeoutMillis();
         if (timeoutMillis <= 0L) {
@@ -217,7 +280,7 @@ public class SubAgentToolExecutor implements ToolExecutor {
                             String deniedReason) throws Exception {
         if (policy.getOnDenied() == HandoffFailureAction.FALLBACK_TO_PRIMARY && delegate != null) {
             try {
-                String output = delegate.execute(call);
+                String output = executePrimaryFallback(call);
                 emitHandoffEvent(AgentEventType.HANDOFF_END, buildHandoffPayload(
                         handoffId,
                         call,
@@ -232,6 +295,24 @@ public class SubAgentToolExecutor implements ToolExecutor {
                         System.currentTimeMillis() - startedAt
                 ));
                 return output;
+            } catch (PrimaryFallbackUnavailableException ex) {
+                // The primary executor cannot serve the subagent tool name (the usual case
+                // under real AgentBuilder wiring). Surface an intentional, clear unavailable
+                // message instead of leaking the internal routing error to the model.
+                emitHandoffEvent(AgentEventType.HANDOFF_END, buildHandoffPayload(
+                        handoffId,
+                        call,
+                        definition,
+                        toolName,
+                        depth,
+                        "denied",
+                        ex.getMessage(),
+                        ex.getMessage(),
+                        deniedReason,
+                        Integer.valueOf(0),
+                        System.currentTimeMillis() - startedAt
+                ));
+                return ex.getMessage();
             } catch (Exception ex) {
                 emitHandoffEvent(AgentEventType.HANDOFF_END, buildHandoffPayload(
                         handoffId,
@@ -275,7 +356,7 @@ public class SubAgentToolExecutor implements ToolExecutor {
                            int attempts) throws Exception {
         if (policy.getOnError() == HandoffFailureAction.FALLBACK_TO_PRIMARY && delegate != null) {
             try {
-                String output = delegate.execute(call);
+                String output = executePrimaryFallback(call);
                 emitHandoffEvent(AgentEventType.HANDOFF_END, buildHandoffPayload(
                         handoffId,
                         call,
@@ -290,6 +371,21 @@ public class SubAgentToolExecutor implements ToolExecutor {
                         System.currentTimeMillis() - startedAt
                 ));
                 return output;
+            } catch (PrimaryFallbackUnavailableException ex) {
+                emitHandoffEvent(AgentEventType.HANDOFF_END, buildHandoffPayload(
+                        handoffId,
+                        call,
+                        definition,
+                        toolName,
+                        depth,
+                        "failed",
+                        ex.getMessage(),
+                        null,
+                        safeMessage(error),
+                        Integer.valueOf(attempts),
+                        System.currentTimeMillis() - startedAt
+                ));
+                return ex.getMessage();
             } catch (Exception ex) {
                 emitHandoffEvent(AgentEventType.HANDOFF_END, buildHandoffPayload(
                         handoffId,

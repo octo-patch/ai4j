@@ -3,6 +3,7 @@ package io.github.lnyocly.ai4j.agent.runtime;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
 import io.github.lnyocly.ai4j.agent.AgentContext;
+import io.github.lnyocly.ai4j.agent.AgentExecutionStatus;
 import io.github.lnyocly.ai4j.agent.AgentOptions;
 import io.github.lnyocly.ai4j.agent.AgentRequest;
 import io.github.lnyocly.ai4j.agent.AgentResult;
@@ -20,6 +21,8 @@ import io.github.lnyocly.ai4j.agent.model.AgentPrompt;
 import io.github.lnyocly.ai4j.agent.subagent.HandoffPolicyException;
 import io.github.lnyocly.ai4j.agent.tool.AgentToolCall;
 import io.github.lnyocly.ai4j.agent.tool.AgentToolCallSanitizer;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolExecution;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolExecutionStatus;
 import io.github.lnyocly.ai4j.agent.tool.AgentToolResult;
 import io.github.lnyocly.ai4j.agent.interceptor.ToolInterceptor;
 import io.github.lnyocly.ai4j.agent.interceptor.ToolCallDecision;
@@ -30,36 +33,64 @@ import io.github.lnyocly.ai4j.agent.sandbox.SandboxSession;
 import io.github.lnyocly.ai4j.agent.sandbox.SandboxResult;
 import io.github.lnyocly.ai4j.agent.skill.AgentSkillRuntimeSupport;
 import io.github.lnyocly.ai4j.agent.compact.CompactPolicy;
+import io.github.lnyocly.ai4j.agent.control.AgentControlFlowException;
 import io.github.lnyocly.ai4j.agent.compact.CompactResult;
 import io.github.lnyocly.ai4j.agent.interceptor.ModelRequestHook;
 import io.github.lnyocly.ai4j.agent.memory.MemorySnapshot;
 import io.github.lnyocly.ai4j.agent.tool.ToolExecutor;
 import io.github.lnyocly.ai4j.agent.tool.TraceableToolExecutor;
+import io.github.lnyocly.ai4j.agent.tool.AgentToolVisibility;
 import io.github.lnyocly.ai4j.extension.lifecycle.AgentLifecycleEventType;
+import io.github.lnyocly.ai4j.platform.openai.chat.entity.ChatMessage;
+import io.github.lnyocly.ai4j.platform.openai.response.entity.ResponseItem;
+import io.github.lnyocly.ai4j.platform.openai.tool.ToolCall;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.AgentRuntime {
 
-    private volatile boolean cancelled = false;
-    private volatile Thread runningThread = null;
+    private final Set<Thread> runningThreads = Collections.newSetFromMap(
+            new ConcurrentHashMap<Thread, Boolean>());
+    private final Set<Thread> cancelledThreads = Collections.newSetFromMap(
+            new ConcurrentHashMap<Thread, Boolean>());
 
     @Override
     public void cancel() {
-        cancelled = true;
-        Thread t = runningThread;
-        if (t != null) {
-            t.interrupt();
+        for (Thread thread : runningThreads) {
+            if (thread != null) {
+                cancelledThreads.add(thread);
+                thread.interrupt();
+            }
         }
+    }
+
+    /** Marks the current invocation as independently cancellable. */
+    protected final void beginRun() {
+        Thread current = Thread.currentThread();
+        cancelledThreads.remove(current);
+        runningThreads.add(current);
+    }
+
+    /** Clears only the current invocation's lifecycle state. */
+    protected final void finishRun() {
+        Thread current = Thread.currentThread();
+        runningThreads.remove(current);
+        cancelledThreads.remove(current);
     }
 
     protected String runtimeName() {
@@ -75,7 +106,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         try {
             return runInternal(context, request, null);
         } finally {
-            runningThread = null;
+            finishRun();
         }
     }
 
@@ -84,7 +115,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         try {
             runInternal(context, request, listener);
         } finally {
-            runningThread = null;
+            finishRun();
         }
     }
 
@@ -93,7 +124,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         try {
             return runInternal(context, request, listener);
         } finally {
-            runningThread = null;
+            finishRun();
         }
     }
 
@@ -103,13 +134,12 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         int maxSteps = options == null ? AgentOptions.DEFAULT_MAX_STEPS : options.getMaxSteps();
         long wallClockTimeoutMs = options == null ? AgentOptions.DEFAULT_WALL_CLOCK_TIMEOUT_MS : options.getWallClockTimeoutMillis();
         long maxTokenBudget = options == null ? AgentOptions.UNLIMITED_TOKEN_BUDGET : options.getMaxTokenBudget();
-        cancelled = false;
-        runningThread = Thread.currentThread();
+        beginRun();
         long startTime = System.currentTimeMillis();
         boolean stream = listener != null && options != null && options.isStream();
         String sessionId = request == null ? null : trimToNull(request.getMetadataString(AgentRequest.METADATA_KEY_SESSION_ID));
         if (sessionId == null) {
-            sessionId = context == null ? null : trimToNull(context.getSessionId());
+            sessionId = trimToNull(context.getSessionId());
         }
         String runId = request == null ? null : trimToNull(request.getMetadataString(AgentRequest.METADATA_KEY_RUN_ID));
         if (runId == null) {
@@ -128,7 +158,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         if (request != null && request.getInput() != null) {
             Object rawInput = request.getInput();
             Object effectiveInput = rawInput;
-            PromptInterceptor promptInterceptor = context == null ? null : context.getPromptInterceptor();
+            PromptInterceptor promptInterceptor = context.getPromptInterceptor();
             if (promptInterceptor != null && rawInput instanceof String) {
                 PromptDecision decision = promptInterceptor.beforePrompt((String) rawInput, context);
                 if (decision == null) {
@@ -144,6 +174,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                                 .turnId(turnId)
                                 .outputText("PROMPT_BLOCKED: " + reason)
                                 .steps(0)
+                                .executionStatus(AgentExecutionStatus.COMPLETED)
                                 .build();
                     case MODIFY:
                         effectiveInput = decision.getModifiedInput();
@@ -154,6 +185,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                 }
             }
             memory.addUserInput(effectiveInput);
+            publish(context, listener, AgentEventType.USER_INPUT, 0, null, effectiveInput, runId, sessionId, turnId);
         }
 
         List<AgentToolCall> toolCalls = new ArrayList<>();
@@ -165,9 +197,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
 
         while (!stepLimited || step < maxSteps) {
             throwIfInterrupted();
-            if (cancelled) {
-                throw new InterruptedException("Agent run cancelled");
-            }
+            throwIfCancelled();
             if (wallClockTimeoutMs > 0 && System.currentTimeMillis() - startTime >= wallClockTimeoutMs) {
                 throw new TimeoutException("Agent run exceeded wall-clock timeout of " + wallClockTimeoutMs + " ms");
             }
@@ -188,11 +218,16 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                 }
             }
 
-            if (modelResult != null && modelResult.getMemoryItems() != null) {
-                memory.addOutputItems(modelResult.getMemoryItems());
-            }
-
             List<AgentToolCall> calls = normalizeToolCalls(modelResult == null ? null : modelResult.getToolCalls(), step);
+            if (modelResult != null && modelResult.getMemoryItems() != null) {
+                // A provider may omit a call id (or return a protocol-specific item whose id
+                // is not copied into AgentToolCall). Normalize the call first, then align the
+                // provider memory item before it is persisted. Otherwise the next request can
+                // contain assistant id=null and function_call_output.call_id=synthetic-id.
+                List<Object> alignedItems = alignMemoryItems(modelResult.getMemoryItems(), calls);
+                memory.addOutputItems(alignedItems);
+                publish(context, listener, AgentEventType.MEMORY_ITEMS_APPENDED, step, null, alignedItems, runId, sessionId, turnId);
+            }
             if (calls == null || calls.isEmpty()) {
                 String outputText = modelResult == null ? "" : modelResult.getOutputText();
                 publish(context, listener, AgentEventType.FINAL_OUTPUT, step, outputText, modelResult == null ? null : modelResult.getRawResponse(), runId, sessionId, turnId);
@@ -206,7 +241,8 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                         .rawResponse(modelResult == null ? null : modelResult.getRawResponse())
                         .toolCalls(toolCalls)
                         .toolResults(toolResults)
-                        .steps(step + 1);
+                        .steps(step + 1)
+                        .executionStatus(AgentExecutionStatus.COMPLETED);
                 return usage.applyTo(result, context).build();
             }
 
@@ -224,6 +260,9 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                         .name(call.getName())
                         .callId(call.getCallId())
                         .output(output)
+                        .ok(Boolean.FALSE)
+                        .error(validationError)
+                        .status(AgentToolExecutionStatus.FAILED)
                         .build();
                 toolResults.add(toolResult);
                 memory.addToolOutput(call.getCallId(), output);
@@ -231,9 +270,29 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
             }
 
             boolean parallelExecution = Boolean.TRUE.equals(context.getParallelToolCalls()) && validatedCalls.size() > 1;
-            List<AgentToolResult> executed = parallelExecution
-                    ? executeToolCallsInParallel(context, validatedCalls, step, listener, runId, sessionId, turnId)
-                    : executeToolCallsSequential(context, validatedCalls, step, listener, runId, sessionId, turnId);
+            List<AgentToolResult> executed;
+            try {
+                executed = parallelExecution
+                        ? executeToolCallsInParallel(context, validatedCalls, step, listener, runId, sessionId, turnId)
+                        : executeToolCallsSequential(context, validatedCalls, step, listener, runId, sessionId, turnId);
+            } catch (AgentControlFlowException controlFlow) {
+                // #262: 宿主介入中断——已进历史的 tool_use 必须有配对 tool_result，
+                // 否则 anthropic_messages 等协议在恢复回合时按 invalid params 400 拒绝。
+                for (AgentToolCall unmatchedCall : validatedCalls) {
+                    String interruptedOutput = "HOST_INPUT_REQUIRED: tool execution interrupted for host mediation; "
+                            + "the conversation continues with a follow-up host/user message.";
+                    memory.addToolOutput(unmatchedCall.getCallId(), interruptedOutput);
+                    publish(context, listener, AgentEventType.TOOL_RESULT, step, interruptedOutput,
+                            AgentToolResult.builder()
+                                    .name(unmatchedCall.getName())
+                                    .callId(unmatchedCall.getCallId())
+                                    .output(interruptedOutput)
+                                    .ok(Boolean.FALSE)
+                                    .build(),
+                            runId, sessionId, turnId);
+                }
+                throw controlFlow;
+            }
             throwIfInterrupted();
 
             for (int i = 0; i < validatedCalls.size(); i++) {
@@ -246,6 +305,22 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
 
             dispatchLifecycle(context, AgentLifecycleEventType.AFTER_TURN, step, runtimeName(), modelResult);
             publish(context, listener, AgentEventType.STEP_END, step, runtimeName(), null, runId, sessionId, turnId);
+            AgentToolResult waitingResult = firstWaiting(executed);
+            if (waitingResult != null) {
+                AgentResult.AgentResultBuilder waiting = AgentResult.builder()
+                        .runId(runId)
+                        .sessionId(sessionId)
+                        .turnId(turnId)
+                        .outputText(modelResult == null ? "" : modelResult.getOutputText())
+                        .rawResponse(modelResult == null ? null : modelResult.getRawResponse())
+                        .toolCalls(toolCalls)
+                        .toolResults(toolResults)
+                        .steps(step + 1)
+                        .executionStatus(AgentExecutionStatus.WAITING)
+                        .operationId(waitingResult.getOperationId())
+                        .waitId(waitingResult.getWaitId());
+                return usage.applyTo(waiting, context).build();
+            }
             step += 1;
         }
 
@@ -258,8 +333,21 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                 .rawResponse(lastResult == null ? null : lastResult.getRawResponse())
                 .toolCalls(toolCalls)
                 .toolResults(toolResults)
-                .steps(step);
+                .steps(step)
+                .executionStatus(AgentExecutionStatus.CONTINUATION_REQUIRED);
         return usage.applyTo(result, context).build();
+    }
+
+    private AgentToolResult firstWaiting(List<AgentToolResult> results) {
+        if (results == null) {
+            return null;
+        }
+        for (AgentToolResult result : results) {
+            if (result != null && result.isWaiting()) {
+                return result;
+            }
+        }
+        return null;
     }
 
     /**
@@ -295,9 +383,16 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         }
     }
 
-    private void throwIfInterrupted() throws InterruptedException {
+    protected final void throwIfInterrupted() throws InterruptedException {
         if (Thread.currentThread().isInterrupted()) {
             throw new InterruptedException("Agent run interrupted");
+        }
+    }
+
+    protected final void throwIfCancelled() throws InterruptedException {
+        throwIfInterrupted();
+        if (cancelledThreads.contains(Thread.currentThread())) {
+            throw new InterruptedException("Agent run cancelled");
         }
     }
 
@@ -318,17 +413,199 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
             }
             normalized.add(AgentToolCall.builder()
                     .callId(callId)
-                    .name(trimToNull(call.getName()) == null ? "tool" : call.getName().trim())
+                    .name(trimToNull(call.getName()))
                     .arguments(call.getArguments())
                     .type(call.getType())
+                    .metadata(call.getMetadata() == null
+                            ? null : new LinkedHashMap<String, Object>(call.getMetadata()))
                     .build());
             index++;
         }
         return normalized;
     }
 
+    /**
+     * Keeps the protocol-specific assistant item and the runtime's normalized calls on the same
+     * call-id. AgentModelClient implementations normally return maps, but ChatMessage and
+     * Responses ResponseItem values are also valid memory entries, so all three representations
+     * are aligned here without imposing one provider format on the generic runtime.
+     */
+    private List<Object> alignMemoryItems(List<Object> memoryItems, List<AgentToolCall> normalizedCalls) {
+        if (memoryItems == null || memoryItems.isEmpty()
+                || normalizedCalls == null || normalizedCalls.isEmpty()) {
+            return memoryItems;
+        }
+        ToolCallMatcher matcher = new ToolCallMatcher(normalizedCalls);
+        List<Object> aligned = new ArrayList<Object>(memoryItems.size());
+        for (Object item : memoryItems) {
+            if (item instanceof Map) {
+                aligned.add(alignMap((Map<?, ?>) item, matcher));
+            } else if (item instanceof ChatMessage) {
+                aligned.add(alignChatMessage((ChatMessage) item, matcher));
+            } else if (item instanceof ResponseItem) {
+                aligned.add(alignResponseItem((ResponseItem) item, matcher));
+            } else {
+                aligned.add(item);
+            }
+        }
+        return aligned;
+    }
+
+    private ChatMessage alignChatMessage(ChatMessage message, ToolCallMatcher matcher) {
+        if (message == null || message.getToolCalls() == null) {
+            return message;
+        }
+        for (ToolCall toolCall : message.getToolCalls()) {
+            if (toolCall == null) {
+                continue;
+            }
+            ToolCall.Function function = toolCall.getFunction();
+            AgentToolCall normalized = matcher.match(toolCall.getId(),
+                    function == null ? null : function.getName(),
+                    function == null ? null : function.getArguments());
+            if (normalized != null) {
+                toolCall.setId(normalized.getCallId());
+            }
+        }
+        return message;
+    }
+
+    private ResponseItem alignResponseItem(ResponseItem item, ToolCallMatcher matcher) {
+        if (item == null || !"function_call".equals(item.getType())) {
+            return item;
+        }
+        AgentToolCall normalized = matcher.match(item.getCallId(), item.getName(), item.getArguments());
+        if (normalized != null) {
+            item.setCallId(normalized.getCallId());
+        }
+        return item;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> alignMap(Map<?, ?> source, ToolCallMatcher matcher) {
+        Map<String, Object> copy = new LinkedHashMap<String, Object>();
+        for (Map.Entry<?, ?> entry : source.entrySet()) {
+            if (entry.getKey() != null) {
+                copy.put(String.valueOf(entry.getKey()), entry.getValue());
+            }
+        }
+
+        Object rawToolCalls = source.get("tool_calls");
+        if (rawToolCalls instanceof List) {
+            List<Object> calls = new ArrayList<Object>();
+            for (Object rawCall : (List<Object>) rawToolCalls) {
+                if (!(rawCall instanceof Map)) {
+                    calls.add(rawCall);
+                    continue;
+                }
+                Map<?, ?> callMap = (Map<?, ?>) rawCall;
+                Map<String, Object> callCopy = new LinkedHashMap<String, Object>();
+                for (Map.Entry<?, ?> entry : callMap.entrySet()) {
+                    if (entry.getKey() != null) {
+                        callCopy.put(String.valueOf(entry.getKey()), entry.getValue());
+                    }
+                }
+                Map<?, ?> function = callMap.get("function") instanceof Map
+                        ? (Map<?, ?>) callMap.get("function") : null;
+                AgentToolCall normalized = matcher.match(
+                        stringValue(callMap.get("id")),
+                        stringValue(function == null ? callMap.get("name") : function.get("name")),
+                        stringValue(function == null ? callMap.get("arguments") : function.get("arguments")));
+                if (normalized != null) {
+                    callCopy.put("id", normalized.getCallId());
+                }
+                calls.add(callCopy);
+            }
+            copy.put("tool_calls", calls);
+        }
+
+        String type = stringValue(source.get("type"));
+        if ("function_call".equals(type)) {
+            AgentToolCall normalized = matcher.match(stringValue(source.get("call_id")),
+                    stringValue(source.get("name")), stringValue(source.get("arguments")));
+            if (normalized != null) {
+                copy.put("call_id", normalized.getCallId());
+            }
+        } else if ("tool_use".equals(type)) {
+            AgentToolCall normalized = matcher.match(stringValue(source.get("id")),
+                    stringValue(source.get("name")), stringValue(source.get("input")));
+            if (normalized != null) {
+                copy.put("id", normalized.getCallId());
+            }
+        }
+
+        Object rawContent = source.get("content");
+        if (rawContent instanceof List) {
+            List<Object> content = new ArrayList<Object>();
+            for (Object part : (List<Object>) rawContent) {
+                content.add(part instanceof Map ? alignMap((Map<?, ?>) part, matcher) : part);
+            }
+            copy.put("content", content);
+        }
+        return copy;
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    private static final class ToolCallMatcher {
+        private final List<AgentToolCall> calls;
+        private final boolean[] matched;
+
+        private ToolCallMatcher(List<AgentToolCall> calls) {
+            this.calls = calls;
+            this.matched = new boolean[calls.size()];
+        }
+
+        private AgentToolCall match(String callId, String name, String arguments) {
+            String normalizedId = trim(callId);
+            if (normalizedId != null) {
+                for (int i = 0; i < calls.size(); i++) {
+                    AgentToolCall candidate = calls.get(i);
+                    if (!matched[i] && normalizedId.equals(trim(candidate.getCallId()))) {
+                        return use(i);
+                    }
+                }
+            }
+            String normalizedName = trim(name);
+            String normalizedArguments = trim(arguments);
+            if (normalizedName != null) {
+                for (int i = 0; i < calls.size(); i++) {
+                    AgentToolCall candidate = calls.get(i);
+                    if (matched[i] || !normalizedName.equals(trim(candidate.getName()))) {
+                        continue;
+                    }
+                    if (normalizedArguments == null
+                            || normalizedArguments.equals(trim(candidate.getArguments()))) {
+                        return use(i);
+                    }
+                }
+            }
+            for (int i = 0; i < calls.size(); i++) {
+                if (!matched[i]) {
+                    return use(i);
+                }
+            }
+            return null;
+        }
+
+        private AgentToolCall use(int index) {
+            matched[index] = true;
+            return calls.get(index);
+        }
+
+        private static String trim(String value) {
+            if (value == null) {
+                return null;
+            }
+            String trimmed = value.trim();
+            return trimmed.isEmpty() ? null : trimmed;
+        }
+    }
+
     protected AgentPrompt buildPrompt(AgentContext context, AgentMemory memory, boolean stream) {
-        return buildPrompt(context, memory, stream, 0, null, null, context == null ? null : context.getSessionId(), null);
+        return buildPrompt(context, memory, stream, 0, null, null, context.getSessionId(), null);
     }
 
     protected AgentPrompt buildPrompt(AgentContext context,
@@ -336,7 +613,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                                       boolean stream,
                                       int step,
                                       AgentListener listener) {
-        return buildPrompt(context, memory, stream, step, listener, null, context == null ? null : context.getSessionId(), null);
+        return buildPrompt(context, memory, stream, step, listener, null, context.getSessionId(), null);
     }
 
     protected AgentPrompt buildPrompt(AgentContext context,
@@ -353,7 +630,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         AgentOptions options = context.getOptions();
         String systemPrompt = mergeText(context.getSystemPrompt(), runtimeInstructions());
 
-        List<Object> tools = context.getToolRegistry() == null ? null : context.getToolRegistry().getTools();
+        List<Object> tools = visibleTools(context);
         List<Object> promptItems = projectItems(context, memory.getItems(), step, listener, runId, sessionId, turnId);
         AgentPrompt.AgentPromptBuilder builder = AgentPrompt.builder()
                 .model(context.getModel())
@@ -376,8 +653,22 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         return builder.build();
     }
 
+    /**
+     * Returns the model-facing registry snapshot. The executor continues to
+     * use the full context registry; visibility is intentionally a request
+     * projection rather than an authorization mechanism.
+     */
+    protected List<Object> visibleTools(AgentContext context) {
+        if (context == null || context.getToolRegistry() == null) {
+            return null;
+        }
+        List<Object> registered = context.getToolRegistry().getTools();
+        AgentToolVisibility visibility = context.getToolVisibility();
+        return visibility == null ? registered : visibility.filter(registered);
+    }
+
     protected List<Object> projectItems(AgentContext context, List<Object> items, int step, AgentListener listener) {
-        return projectItems(context, items, step, listener, null, context == null ? null : context.getSessionId(), null);
+        return projectItems(context, items, step, listener, null, context.getSessionId(), null);
     }
 
     protected List<Object> projectItems(AgentContext context,
@@ -400,7 +691,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
 
     protected AgentModelResult executeModel(AgentContext context, AgentPrompt prompt, AgentListener listener, int step, boolean stream, String runId, String sessionId, String turnId) throws Exception {
         // beforeModelRequest interception: allow modifying the full prompt (system, items, temperature, etc.)
-        ModelRequestHook modelHook = context == null ? null : context.getModelRequestHook();
+        ModelRequestHook modelHook = context.getModelRequestHook();
         if (modelHook != null) {
             AgentPrompt modified = modelHook.beforeModelRequest(prompt, context);
             if (modified != null) {
@@ -475,7 +766,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
     }
 
     protected AgentModelResult executeModel(AgentContext context, AgentPrompt prompt, AgentListener listener, int step, boolean stream) throws Exception {
-        return executeModel(context, prompt, listener, step, stream, null, context == null ? null : context.getSessionId(), null);
+        return executeModel(context, prompt, listener, step, stream, null, context.getSessionId(), null);
     }
 
     private Map<String, Object> retryPayload(int attempt, int maxAttempts, Throwable cause) {
@@ -496,7 +787,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                                  AgentToolCall call,
                                  Integer step,
                                  AgentListener listener) throws Exception {
-        return executeTool(context, call, step, listener, null, context == null ? null : context.getSessionId(), null);
+        return executeTool(context, call, step, listener, null, context.getSessionId(), null);
     }
 
     protected String executeTool(AgentContext context,
@@ -506,12 +797,28 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                                  String runId,
                                  String sessionId,
                                  String turnId) throws Exception {
+        AgentToolResult result = executeToolResult(context, call, step, listener, runId, sessionId, turnId);
+        return result == null ? null : result.getOutput();
+    }
+
+    /**
+     * Executes a tool while preserving structured asynchronous state. The
+     * legacy string method above remains the compatibility surface used by
+     * older custom runtimes.
+     */
+    protected AgentToolResult executeToolResult(AgentContext context,
+                                                AgentToolCall call,
+                                                Integer step,
+                                                AgentListener listener,
+                                                String runId,
+                                                String sessionId,
+                                                String turnId) throws Exception {
         ToolExecutor executor = context.getToolExecutor();
         if (executor == null) {
             throw new IllegalStateException("toolExecutor is required");
         }
         AgentToolCall effectiveCall = call;
-        ToolInterceptor interceptor = context == null ? null : context.getToolInterceptor();
+        ToolInterceptor interceptor = context.getToolInterceptor();
         if (interceptor != null) {
             ToolCallDecision decision = interceptor.beforeToolCall(call, context);
             if (decision == null) {
@@ -519,12 +826,12 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
             }
             switch (decision.getType()) {
                 case BLOCK:
-                    return buildBlockedOutput(call, decision.getReason());
+                    return result(call, buildBlockedOutput(call, decision.getReason()), AgentToolExecutionStatus.FAILED);
                 case MODIFY:
                     effectiveCall = decision.getModifiedCall();
                     break;
                 case ROUTE_TO:
-                    return routeToSandbox(context, call, decision);
+                    return result(call, routeToSandbox(context, call, decision), AgentToolExecutionStatus.COMPLETED);
                 case ALLOW:
                 default:
                     break;
@@ -533,35 +840,87 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         final AgentToolCall callToRun = effectiveCall;
         try {
             dispatchLifecycle(context, AgentLifecycleEventType.BEFORE_TOOL_CALL, step == null ? 0 : step, callToRun == null ? null : callToRun.getName(), callToRun);
-            String output = AgentToolExecutionScope.runWithEmitter(new AgentToolExecutionScope.EventEmitter() {
+            AgentToolResult toolResult = AgentToolExecutionScope.runWithEmitter(new AgentToolExecutionScope.EventEmitter() {
                 @Override
                 public void emit(AgentEventType type, String message, Object payload) {
                     publish(context, listener, type, step == null ? 0 : step, message, payload, runId, sessionId, turnId);
                 }
-            }, new AgentToolExecutionScope.ScopeCallable<String>() {
+            }, new AgentToolExecutionScope.ScopeCallable<AgentToolResult>() {
                 @Override
-                public String call() throws Exception {
-                    return executor.execute(callToRun);
+                public AgentToolResult call() throws Exception {
+                    return executeToolInvocation(executor, callToRun);
                 }
             });
+            toolResult = normalizeToolResult(callToRun, toolResult);
             // PostToolUse interception: a hook may veto the result (e.g. output leaked a secret).
             if (interceptor != null) {
-                ToolCallDecision after = interceptor.afterToolCall(callToRun, output, context);
+                ToolCallDecision after = interceptor.afterToolCall(callToRun, toolResult.getOutput(), context);
                 if (after != null && after.getType() == ToolCallDecision.Type.BLOCK) {
-                    return buildBlockedOutput(callToRun, after.getReason());
+                    return result(callToRun, buildBlockedOutput(callToRun, after.getReason()), AgentToolExecutionStatus.FAILED);
                 }
             }
-            return output;
+            return toolResult;
         } catch (InterruptedException interruptedException) {
             Thread.currentThread().interrupt();
             throw interruptedException;
         } catch (HandoffPolicyException handoffPolicyException) {
             throw handoffPolicyException;
+        } catch (AgentControlFlowException controlFlowException) {
+            // #262: 宿主介入（审批/用户输入）必须中断循环并抛给调用方，禁止降级为 TOOL_ERROR。
+            throw controlFlowException;
         } catch (Exception ex) {
-            return buildToolErrorOutput(callToRun, ex);
+            return result(callToRun, buildToolErrorOutput(callToRun, ex), AgentToolExecutionStatus.FAILED);
         } finally {
             dispatchLifecycle(context, AgentLifecycleEventType.AFTER_TOOL_CALL, step == null ? 0 : step, callToRun == null ? null : callToRun.getName(), callToRun);
         }
+    }
+
+    private AgentToolResult executeToolInvocation(ToolExecutor executor,
+                                                  AgentToolCall call) throws Exception {
+        if (executor instanceof io.github.lnyocly.ai4j.agent.tool.AsyncToolExecutor) {
+            AgentToolExecution execution = ((io.github.lnyocly.ai4j.agent.tool.AsyncToolExecutor) executor).start(call);
+            if (execution == null) {
+                return result(call, null, AgentToolExecutionStatus.COMPLETED);
+            }
+            AgentToolResult initial = execution.isPending()
+                    ? execution.getInitialResult()
+                    : execution.await();
+            return normalizeToolResult(call, initial);
+        }
+        return result(call, executor.execute(call), AgentToolExecutionStatus.COMPLETED);
+    }
+
+    private AgentToolResult normalizeToolResult(AgentToolCall call, AgentToolResult source) {
+        AgentToolResult result = source == null ? new AgentToolResult() : source;
+        if (result.getName() == null && call != null) {
+            result.setName(call.getName());
+        }
+        if (result.getCallId() == null && call != null) {
+            result.setCallId(call.getCallId());
+        }
+        if (result.getOutput() == null) {
+            result.setOutput("");
+        }
+        if (result.getStatus() == null) {
+            result.setStatus(result.getOutput() != null && result.getOutput().startsWith("TOOL_ERROR")
+                    ? AgentToolExecutionStatus.FAILED
+                    : AgentToolExecutionStatus.COMPLETED);
+        }
+        if (result.isFailed() && result.getOk() == null) {
+            result.setOk(Boolean.FALSE);
+        }
+        return result;
+    }
+
+    private AgentToolResult result(AgentToolCall call, String output, AgentToolExecutionStatus status) {
+        return AgentToolResult.builder()
+                .name(call == null ? null : call.getName())
+                .callId(call == null ? null : call.getCallId())
+                .output(output)
+                .status(status)
+                .ok(AgentToolExecutionStatus.FAILED.equals(status) ? Boolean.FALSE : null)
+                .error(AgentToolExecutionStatus.FAILED.equals(status) ? output : null)
+                .build();
     }
 
     protected String buildBlockedOutput(AgentToolCall call, String reason) {
@@ -678,19 +1037,34 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                                                              String runId,
                                                              String sessionId,
                                                              String turnId) throws Exception {
-        ExecutorService executor = Executors.newFixedThreadPool(calls.size());
+        Integer cap = context == null ? null : context.getMaxParallelToolCalls();
+        int poolSize = (cap == null || cap <= 0) ? calls.size() : Math.min(calls.size(), cap);
+        Long timeoutMillis = context == null ? null : context.getToolCallTimeoutMillis();
+        ExecutorService executor = Executors.newFixedThreadPool(poolSize, new ToolCallThreadFactory());
         try {
             List<Future<AgentToolResult>> futures = new ArrayList<>();
             for (AgentToolCall call : calls) {
                 futures.add(executor.submit(() -> runToolAndCaptureTrace(context, call, step, listener, runId, sessionId, turnId)));
             }
             List<AgentToolResult> results = new ArrayList<>();
-            for (Future<AgentToolResult> future : futures) {
-                results.add(waitForFuture(future));
+            for (int i = 0; i < futures.size(); i++) {
+                results.add(waitForFuture(futures.get(i), calls.get(i), timeoutMillis));
             }
             return results;
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    /** Daemon threads for per-turn tool dispatch so a leaked worker cannot block JVM shutdown. */
+    private static final class ToolCallThreadFactory implements ThreadFactory {
+        private final AtomicInteger sequence = new AtomicInteger();
+
+        @Override
+        public Thread newThread(Runnable runnable) {
+            Thread thread = new Thread(runnable, "ai4j-tool-exec-" + sequence.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
         }
     }
 
@@ -702,14 +1076,23 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                                                    String runId,
                                                    String sessionId,
                                                    String turnId) throws Exception {
-        String output = executeTool(context, call, step, listener, runId, sessionId, turnId);
+        AgentToolResult toolResult = executeToolResult(context, call, step, listener, runId, sessionId, turnId);
         Object trace = toolTrace(context);
-        return AgentToolResult.builder()
-                .name(call.getName())
-                .callId(call.getCallId())
-                .output(output)
-                .trace(trace)
-                .build();
+        if (toolResult == null) {
+            toolResult = result(call, null, AgentToolExecutionStatus.COMPLETED);
+        }
+        toolResult.setName(call.getName());
+        toolResult.setCallId(call.getCallId());
+        if (trace != null) {
+            toolResult.setTrace(trace);
+        }
+        // #264: 运行时 TOOL_ERROR 输出带上 ok=false，供 AgentTraceListener 标 ERROR
+        if (toolResult.getOutput() != null && toolResult.getOutput().startsWith("TOOL_ERROR")) {
+            toolResult.setOk(Boolean.FALSE);
+            toolResult.setError(toolResult.getOutput());
+            toolResult.setStatus(AgentToolExecutionStatus.FAILED);
+        }
+        return toolResult;
     }
 
     /** Returns the executor's last sub-trace (if it is a TraceableToolExecutor), else null. */
@@ -718,9 +1101,25 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
         return executor instanceof TraceableToolExecutor ? ((TraceableToolExecutor) executor).lastTrace() : null;
     }
 
-    private <T> T waitForFuture(Future<T> future) throws Exception {
+    /**
+     * Waits for one tool call. When {@code timeoutMillis} is positive, a call that overruns the
+     * budget is cancelled and converted to a FAILED tool result (same convention as a tool that
+     * throws); sibling futures keep waiting normally.
+     */
+    private AgentToolResult waitForFuture(Future<AgentToolResult> future,
+                                          AgentToolCall call,
+                                          Long timeoutMillis) throws Exception {
         try {
-            return future.get();
+            if (timeoutMillis == null || timeoutMillis <= 0) {
+                return future.get();
+            }
+            return future.get(timeoutMillis, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException timeout) {
+            future.cancel(true);
+            return result(call,
+                    buildToolErrorOutput(call, new TimeoutException(
+                            "tool call exceeded toolCallTimeoutMillis of " + timeoutMillis + " ms")),
+                    AgentToolExecutionStatus.FAILED);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw e;
@@ -742,10 +1141,13 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
                            String runId,
                            String sessionId,
                            String turnId) {
+        if (context == null) {
+            return;
+        }
         AgentEvent event = AgentEvent.builder()
                 .eventId(UUID.randomUUID().toString())
                 .runId(runId)
-                .sessionId(sessionId == null ? (context == null ? null : context.getSessionId()) : sessionId)
+                .sessionId(sessionId == null ? context.getSessionId() : sessionId)
                 .turnId(turnId)
                 .type(type)
                 .step(step)
@@ -762,7 +1164,7 @@ public abstract class BaseAgentRuntime implements io.github.lnyocly.ai4j.agent.A
     }
 
     protected void publish(AgentContext context, AgentListener listener, AgentEventType type, int step, String message, Object payload) {
-        publish(context, listener, type, step, message, payload, null, context == null ? null : context.getSessionId(), null);
+        publish(context, listener, type, step, message, payload, null, context.getSessionId(), null);
     }
 
     protected void dispatchLifecycle(AgentContext context,

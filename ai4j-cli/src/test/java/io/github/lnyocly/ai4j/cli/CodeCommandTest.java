@@ -333,32 +333,39 @@ public class CodeCommandTest {
                 "Review repository changes safely."
         ), StandardCharsets.UTF_8);
 
-        ByteArrayInputStream input = new ByteArrayInputStream(
-                ("/skills\n"
-                        + "/exit\n").getBytes(StandardCharsets.UTF_8)
-        );
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        ByteArrayOutputStream err = new ByteArrayOutputStream();
+        String originalUserHome = System.getProperty("user.home");
+        System.setProperty("user.home", workspace.resolve("isolated-home").toString());
+        try {
 
-        CodeCommand command = new CodeCommand(
-                new FakeCodingCliAgentFactory(),
-                Collections.<String, String>emptyMap(),
-                new Properties(),
-                workspace
-        );
+            ByteArrayInputStream input = new ByteArrayInputStream(
+                    ("/skills\n"
+                            + "/exit\n").getBytes(StandardCharsets.UTF_8)
+            );
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            ByteArrayOutputStream err = new ByteArrayOutputStream();
 
-        int exitCode = command.run(
-                Arrays.asList("--model", "fake-model", "--workspace", workspace.toString()),
-                new StreamsTerminalIO(input, out, err)
-        );
+            CodeCommand command = new CodeCommand(
+                    new FakeCodingCliAgentFactory(),
+                    Collections.<String, String>emptyMap(),
+                    new Properties(),
+                    workspace
+            );
 
-        String output = new String(out.toByteArray(), StandardCharsets.UTF_8);
-        Assert.assertEquals(0, exitCode);
-        Assert.assertTrue(output.contains("skills:"));
-        Assert.assertTrue(output.contains("count=1"));
-        Assert.assertTrue(output.contains("repo-review"));
-        Assert.assertTrue(output.contains("source=workspace"));
-        Assert.assertTrue(output.contains("Review repository changes safely."));
+            int exitCode = command.run(
+                    Arrays.asList("--model", "fake-model", "--workspace", workspace.toString()),
+                    new StreamsTerminalIO(input, out, err)
+            );
+
+            String output = new String(out.toByteArray(), StandardCharsets.UTF_8);
+            Assert.assertEquals(0, exitCode);
+            Assert.assertTrue(output.contains("skills:"));
+            Assert.assertTrue(output.contains("count=1"));
+            Assert.assertTrue(output.contains("repo-review"));
+            Assert.assertTrue(output.contains("source=workspace"));
+            Assert.assertTrue(output.contains("Review repository changes safely."));
+        } finally {
+            restoreProperty("user.home", originalUserHome);
+        }
     }
 
     @Test
@@ -1716,6 +1723,12 @@ public class CodeCommandTest {
                 }
             });
 
+            long startDeadline = System.currentTimeMillis() + 5000L;
+            while (System.currentTimeMillis() < startDeadline && terminal.getReadLineCalls() < 1) {
+                Thread.sleep(20L);
+            }
+            Assert.assertEquals("first scripted prompt was never consumed", 1, terminal.getReadLineCalls());
+
             long deadline = System.currentTimeMillis() + 300L;
             while (System.currentTimeMillis() < deadline && terminal.getReadLineCalls() < 2) {
                 Thread.sleep(20L);
@@ -1969,9 +1982,11 @@ public class CodeCommandTest {
             invokePrivateMethod(runner, "interruptActiveMainBufferTurn", new Class<?>[]{String.class}, turnId);
 
             int exitCode = future.get(5, TimeUnit.SECONDS);
-            String rendered = output.toString(StandardCharsets.UTF_8.name());
             Assert.assertEquals(0, exitCode);
-            Assert.assertTrue(rendered.contains("Conversation interrupted by user."));
+            awaitOutputContains(output, "Conversation interrupted by user.");
+            String rendered = output.toString(StandardCharsets.UTF_8.name());
+            Assert.assertTrue("Missing cancellation notice in: " + rendered,
+                    rendered.contains("Conversation interrupted by user."));
             Assert.assertFalse(rendered.contains("Slow hello done."));
             Assert.assertEquals(2, handler.getReadLineCalls());
         } finally {
@@ -2018,8 +2033,9 @@ public class CodeCommandTest {
         );
         TuiInteractionState interactionState = new TuiInteractionState();
         CountDownLatch cancelled = new CountDownLatch(1);
+        CountDownLatch streamStarted = new CountDownLatch(1);
         CodingCliAgentFactory agentFactory = new CustomModelCodingCliAgentFactory(
-                new ChatModelClient(new BlockingChatService(cancelled))
+                new ChatModelClient(new BlockingChatService(cancelled, streamStarted))
         );
         CodingCliAgentFactory.PreparedCodingAgent prepared = agentFactory.prepare(options, terminalIO, interactionState);
         CodingCliSessionRunner runner = new CodingCliSessionRunner(
@@ -2054,13 +2070,18 @@ public class CodeCommandTest {
                 }
             }
             Assert.assertNotNull(turnId);
-            invokePrivateMethod(runner, "interruptActiveMainBufferTurn", new Class<?>[]{String.class}, turnId);
+            Assert.assertTrue("model stream never became active", streamStarted.await(5L, TimeUnit.SECONDS));
+            Object interruptResult = invokePrivateMethod(runner, "interruptActiveMainBufferTurn", new Class<?>[]{String.class}, turnId);
 
             int exitCode = future.get(5, TimeUnit.SECONDS);
-            String rendered = output.toString(StandardCharsets.UTF_8.name());
             Assert.assertEquals(0, exitCode);
             Assert.assertTrue(cancelled.await(1, TimeUnit.SECONDS));
-            Assert.assertTrue(rendered.contains("Conversation interrupted by user."));
+            // The capture terminal is an ExternalTerminal whose pump thread drains
+            // asynchronously; wait for the notice to reach the stream before asserting.
+            awaitOutputContains(output, "Conversation interrupted by user.");
+            String rendered = output.toString(StandardCharsets.UTF_8.name());
+            Assert.assertTrue("Missing cancellation notice (interruptResult=" + interruptResult + ", turnId=" + turnId + ") in: " + rendered,
+                    rendered.contains("Conversation interrupted by user."));
             Assert.assertFalse(rendered.contains("slow chat stream completed"));
             Assert.assertEquals(2, handler.getReadLineCalls());
         } finally {
@@ -2221,9 +2242,11 @@ public class CodeCommandTest {
     private static final class BlockingChatService implements IChatService {
 
         private final CountDownLatch cancelled;
+        private final CountDownLatch streamStarted;
 
-        private BlockingChatService(CountDownLatch cancelled) {
+        private BlockingChatService(CountDownLatch cancelled, CountDownLatch streamStarted) {
             this.cancelled = cancelled;
+            this.streamStarted = streamStarted;
         }
 
         @Override
@@ -2250,6 +2273,7 @@ public class CodeCommandTest {
                 @Override
                 public void cancel() {
                     cancelled.countDown();
+                    eventSourceListener.getCountDownLatch().countDown();
                 }
             }, new okhttp3.Response.Builder()
                     .request(new Request.Builder().url("http://localhost/test").build())
@@ -2258,6 +2282,7 @@ public class CodeCommandTest {
                     .message("OK")
                     .build());
 
+            streamStarted.countDown();
             if (!eventSourceListener.getCountDownLatch().await(5, TimeUnit.SECONDS)) {
                 throw new AssertionError("stream was not released");
             }
@@ -2532,6 +2557,16 @@ public class CodeCommandTest {
         Method method = target.getClass().getDeclaredMethod(methodName, parameterTypes);
         method.setAccessible(true);
         return method.invoke(target, args);
+    }
+
+    private static void awaitOutputContains(ByteArrayOutputStream output, String expected) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            if (new String(output.toByteArray(), StandardCharsets.UTF_8).contains(expected)) {
+                return;
+            }
+            Thread.sleep(10L);
+        }
     }
 
     private static final class ScriptedLineReaderHandler implements InvocationHandler {

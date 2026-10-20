@@ -65,6 +65,24 @@ public class AgentApprovalPermissionPolicyTest {
     }
 
     @Test
+    public void harnessApprovalCannotOverrideDenyPolicy() throws Exception {
+        CountingToolExecutor delegate = new CountingToolExecutor();
+        AgentPermissionToolExecutor executor = new AgentPermissionToolExecutor(
+                delegate,
+                AgentPermissionPolicies.denyTools(Collections.singleton("bash"), "shell is forbidden"),
+                AgentExecutionEnvironment.LOCAL);
+
+        try {
+            executor.execute(call("bash").withMetadata(
+                    AgentToolCall.METADATA_KEY_HARNESS_APPROVAL_GRANTED, Boolean.TRUE));
+            Assert.fail("Harness approval must not override an explicit DENY policy");
+        } catch (AgentPermissionException expected) {
+            Assert.assertTrue(expected.getMessage().contains("shell is forbidden"));
+        }
+        Assert.assertEquals(0, delegate.count);
+    }
+
+    @Test
     public void shouldBlockApprovalRequiredToolBeforeDelegateRuns() throws Exception {
         CountingToolExecutor delegate = new CountingToolExecutor();
         AgentPermissionToolExecutor executor = new AgentPermissionToolExecutor(
@@ -145,14 +163,14 @@ public class AgentApprovalPermissionPolicyTest {
                 .options(AgentOptions.builder().maxSteps(4).build())
                 .build();
 
-        AgentResult result = agent.run(AgentRequest.builder().input("hi").build());
-
-        Assert.assertEquals("done", result.getOutputText());
+        // #262: approval-required 是控制流——中断 run 并抛给宿主，不再降级 TOOL_ERROR 让模型继续。
+        try {
+            agent.run(AgentRequest.builder().input("hi").build());
+            Assert.fail("expected AgentApprovalRequiredException");
+        } catch (AgentApprovalRequiredException expected) {
+            Assert.assertEquals("write_file", expected.getRequest().getToolName());
+        }
         Assert.assertEquals("write_file must be blocked by default SAFE policy", 0, delegate.count);
-        Assert.assertEquals(1, result.getToolResults().size());
-        Assert.assertTrue("must mention approval requirement",
-                result.getToolResults().get(0).getOutput().contains("approval")
-                        || result.getToolResults().get(0).getOutput().contains("Approval"));
     }
 
     @Test
@@ -169,9 +187,13 @@ public class AgentApprovalPermissionPolicyTest {
                 .options(AgentOptions.builder().maxSteps(4).build())
                 .build();
 
-        AgentResult result = agent.run(AgentRequest.builder().input("hi").build());
-
-        Assert.assertEquals("done", result.getOutputText());
+        // #262: 同上，SAFE 策略下的审批需求以控制流异常抛出。
+        try {
+            agent.run(AgentRequest.builder().input("hi").build());
+            Assert.fail("expected AgentApprovalRequiredException");
+        } catch (AgentApprovalRequiredException expected) {
+            Assert.assertEquals("bash", expected.getRequest().getToolName());
+        }
         Assert.assertEquals("bash must be blocked by default SAFE policy", 0, delegate.count);
     }
 

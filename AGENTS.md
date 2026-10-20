@@ -31,10 +31,12 @@ Treat this repository as a 10-module monorepo plus docs/demo surfaces.
 
 - Use `ha` (Harness Anything) for all new project-management work.
 - `harness/` is the active private HA ledger with its own nested Git repository. `.harness/` is generated projection/cache state. Neither belongs in code PRs; commit ledger changes inside `harness/` separately when they must be retained.
-- Before substantive work, run `ha doctor --json`, ensure the project has been initialized with `ha init --name ai4j-sdk`, and inspect `ha status --json` / `ha check --profile target-project --strict --json`.
+- Before substantive work, treat `ha capabilities --json` and the relevant `ha <domain> --help` output as the command authority. If this workspace is not initialized, run `ha init --repo-id ai4j-sdk --person-id <person-id> --display-name "<display-name>"`; then inspect `ha daemon status`, `ha agenda`, `ha agent list --json`, `ha squad list --json`, and `ha runtime instance list`.
+- The current thin CLI does not expose the historical `ha doctor --json`, `ha status --json`, or `ha check --profile target-project --strict --json` preflight commands. Do not copy those commands from older task records; use the live capabilities/help output instead.
 - HA writes require explicit actor attribution. Agents use `HARNESS_ACTOR=agent:<id>` or an explicit agent actor; humans use `ha --actor human:<id>`. Do not export a human actor for child processes. Configure `HARNESS_GIT_AUTHOR_NAME` and `HARNESS_GIT_AUTHOR_EMAIL` for local ledger commits.
 - The normal write path is the daemon-backed CLI. `HARNESS_DAEMON_MODE=direct` is only for bootstrap, recovery, or isolated tests, and must carry `HARNESS_DIRECT_WRITE_REASON=recovery|test`.
-- Complete work through the current HA lifecycle: claim an Execution, record progress/evidence, obtain a typed human review/consent when required, and run `ha task complete`. `ha task review` is legacy compatibility lint, not the approval gate.
+- Fable identities are installed from packages containing `agent.json` or `squad.json`: validate with `ha agent validate --source <dir>` or `ha squad validate --source <dir>`, install with `ha agent install --source <dir>` or `ha squad install --source <dir>`, then read back with `ha agent list --json` plus `ha agent inspect <id>` or `ha squad list --json` plus `ha squad inspect <id>`. Dispatch uses a declared identity plus a ready runtime instance; the instance is an execution resource, not the agent or squad identity.
+- Complete work through the current HA lifecycle: acquire an Execution lease, record progress/evidence, obtain a typed human review/consent when required, and run `ha task complete`. `ha task review` is legacy compatibility lint, not the approval gate.
 
 ## Hard Rules
 
@@ -141,7 +143,7 @@ Treat this repository as a 10-module monorepo plus docs/demo surfaces.
 | Regression / smoke / verification work | `docs/11-REFERENCE/testing-standard.md` and `docs/05-TEST-QA/Regression-SSoT.md` |
 | Planning / task tracking / SSoT maintenance | `docs/11-REFERENCE/harness-anything-standard.md` and `AGENTS.md` |
 | Walkthrough closeout | `docs/11-REFERENCE/harness-anything-standard.md` and the HA task `closeout.md` |
-| Worktree setup / branch isolation / multi-agent coordination | `docs/11-REFERENCE/harness-anything-standard.md` and `ha worktree --help` |
+| Worktree setup / branch isolation / multi-agent coordination | `docs/11-REFERENCE/harness-anything-standard.md`, `ha capabilities --json`, and `git worktree --help` |
 
 ## Harness Files
 
@@ -163,13 +165,13 @@ Treat this repository as a 10-module monorepo plus docs/demo surfaces.
 
 ## Execution Flow
 
-1. Run `ha doctor --json`, inspect `ha status --json`, and initialize/register the active HA workspace when needed.
-2. Create and claim an HA task before substantive editing; use `ha worktree create --task <id>` when isolation is needed.
+1. Run `ha capabilities --json`, inspect `ha daemon status` / `ha agenda`, and initialize/register the active HA workspace when needed.
+2. Create, pin, and start an HA task before substantive editing: use `ha task create`, `ha task pin <task-id>`, and `ha task start <task-id>`; use the repository-supported `git worktree` flow when isolation is needed.
 3. Record scope and meaningful progress with `ha task progress append`; promote durable observations to Facts and architectural choices to Decisions.
 4. Implement in the narrowest correct module boundary.
 5. Run targeted regression based on `docs/05-TEST-QA/Cadence-Ledger.md` and record command evidence in the HA task.
 6. Update the tracked Regression SSoT/Cadence Ledger if a fixed gate or evidence scope changes.
-7. Move the task to review, obtain typed human review/consent where required, and run `ha task complete <id>`.
+7. Submit the Execution, obtain typed independent review and owner consent, and run `ha task complete <id>`; use `ha task closeout` when a canonical closeout packet is available.
 8. Commit outer code/docs separately from the private `harness/` ledger; keep `.harness/` untracked and rebuildable.
 
 ## Review Focus
@@ -181,3 +183,38 @@ When reviewing changes in this repo, prioritize:
 3. Runtime / CLI / FlowGram behavioral regressions
 4. Missing regression updates for newly touched surfaces
 5. Drift between code changes and docs/reference guidance
+
+## Scope Limits
+
+These bound what you **propose**, never what you look for. Report anything that is actually wrong here — including a rare-looking case, if this project actually produces it. Then keep the fix in scope.
+
+1. This is not a security paper. Verification is welcome; over-defense is not. Unless this project states otherwise, assume a cooperating operator on their own machine; if it has a real adversary, it will say so and that scope wins.
+2. Do not add hashes, checksums, or fingerprints unless the hash replaces a materially more expensive operation **and** its result changes what happens next.
+3. No defensive scaffolding: no feature flags, migration frameworks, compat layers, or wrappers for cases that do not occur here.
+4. No corner-case obsession: exotic encodings, symlink races, RTL text, and millisecond races are out of scope unless the case is reachable through this project's supported use — its documented inputs, its published interface, its real data. Reachable is enough; you do not need a reproduction. Constructible in principle is not enough.
+5. Where judgement is needed, judge. Do not replace it with a scoring table, a checklist, or a re-verification loop over something already settled.
+6. None of this overrides security, migration, verification, or review that the user, this project's own conventions, or a higher-priority rule asked for. Those were requested; they are the work, not scope creep.
+
+### Calibration
+
+Shapes already seen. Examples, not a checklist — a real finding is not dismissed by resembling one:
+
+| | Shape |
+|---|---|
+| H | hashing every row of two spreadsheets to answer what comparing cells answers |
+| H | writing checksum files that nothing ever reads |
+| E | hardening the accounts of an app that has no users and no deployment |
+| R | auditing your own patch all night while the feature stays unwritten |
+| R | a reviewer that returns a failing verdict on everything |
+| O | guards whose justification is the previous guard, not the requirement |
+
+And two that look like the above and are not. **Report these:**
+
+| | Shape |
+|---|---|
+| ✓ | a digest that lets you skip re-reading a large file you already have |
+| ✓ | a rare-looking input this project's own documentation example produces |
+
+Before running any check, answer: what specific failure would this detect, and what would I do differently if it occurred? No answer means do not run it.
+
+Say plainly when something is correct. Do not manufacture findings.

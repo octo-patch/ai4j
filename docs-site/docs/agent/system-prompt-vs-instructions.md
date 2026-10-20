@@ -1,9 +1,11 @@
 ---
 sidebar_position: 2
+title: 系统提示词与指令
+description: 厘清 ai4j-agent 里 systemPrompt 与 instructions 的源码语义：两者都是 AgentContext 配置、每步重复进入模型，但在 Chat 与 Responses 路径映射不同，CodeAct 下更需分层。
+tags: [concept]
 ---
 
-# System Prompt vs Instructions
-
+# 系统提示词与指令
 这一页讲的不是泛泛的 prompt engineering，而是 AI4J Agent 里这两个字段在源码中的真实语义。
 
 如果这里理解错了，后面会连带把这些事情一起理解错：
@@ -12,6 +14,31 @@ sidebar_position: 2
 - 为什么 Chat 和 Responses 的请求形状不一样
 - 为什么 trace 里看到的 `systemPrompt` 和你写进去的字符串不完全一样
 - 为什么 `newSession()` 后 prompt 规则没有变
+
+## 实现机理图（交互式）
+
+下图把 `buildPrompt` 流水线画全：`systemPrompt` 与 `runtimeInstructions` 合并，`ContextProjector`+`ContextBudget` 对 memory items 做投影裁剪，`ToolVisibility` 过滤出 visibleTools，装配成 `AgentPrompt` 后先过 `ModelRequestHook` 再进 `ModelClient`。
+
+import useBaseUrl from '@docusaurus/useBaseUrl';
+
+<iframe
+  src={useBaseUrl('/archify/prompt-context-projection.html')}
+  title="buildPrompt 组装与上下文投影 · 交互式架构图"
+  style={{width: '100%', height: 940, border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: 8}}
+/>
+
+<a href={useBaseUrl('/archify/prompt-context-projection.html')} target="_blank" rel="noopener noreferrer">在新窗口打开全屏大图</a>（含双主题、缩放与导出功能）。
+
+**视角补充：buildPrompt 数据流** — AgentMemory items 经 ContextProjector+Budget 投影裁剪；与 systemPrompt/instructions/visibleTools 合成 ModelRequest → ModelRequestHook 末次改写 → ModelClient 发送。
+
+<iframe
+  src={useBaseUrl('/archify/prompt-build-pipeline.html')}
+  title="prompt-build-pipeline"
+  style={{width: '100%', height: 940, border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: 8}}
+/>
+
+<a href={useBaseUrl('/archify/prompt-build-pipeline.html')} target="_blank" rel="noopener noreferrer">在新窗口打开全屏大图</a>（含明暗双主题、缩放与导出）。
+
 
 ## 1. 先抓住 6 个关键设计决策
 
@@ -451,7 +478,7 @@ Agent agent = Agents.react()
 
 ## 13. 继续阅读
 
-1. [Model Client Selection](/docs/agent/model-client-selection)
+1. [模型客户端选型](/docs/agent/model-client-selection)
 2. [Quickstart](/docs/agent/quickstart)
 3. [Architecture](/docs/agent/architecture)
-4. [Runtime Implementations](/docs/agent/runtime-implementations)
+4. [运行时实现](/docs/agent/runtimes/runtime-implementations)

@@ -803,6 +803,9 @@ public class ToolUtil {
                         function.setDescription(functionCall.description());
 
                         setFunctionParameters(function, functionClass);
+                        if (functionCall.strict()) {
+                            applyStrictMode(function);
+                        }
                         toolClassMap.put(functionName, functionClass);
                         return function;
                     }
@@ -930,6 +933,19 @@ public class ToolUtil {
     }
 
     /**
+     * 开启严格模式：调整 schema 以满足 OpenAI 的硬性要求
+     * （{@code additionalProperties=false}、所有字段列入 {@code required}、
+     * 可选字段标为可空），并把 {@code strict} 置为 {@code true}。
+     */
+    private static void applyStrictMode(Tool.Function function) {
+        Tool.Function.Parameter params = function.getParameters();
+        if (params != null) {
+            params.enforceStrictSchema();
+        }
+        function.setStrict(Boolean.TRUE);
+    }
+
+    /**
      * 从类型创建属性对象
      */
     private static Tool.Function.Property createPropertyFromType(Class<?> fieldType, String description) {
@@ -972,8 +988,6 @@ public class ToolUtil {
                 items.setType("object");
             }
             property.setItems(items);
-        } else if (Map.class.isAssignableFrom(fieldType)) {
-            property.setType("object");
         } else {
             property.setType("object");
         }

@@ -1,5 +1,10 @@
-# Agent Architecture
+---
+title: Agent 架构
+description: "拆解 ai4j-agent 的 Builder、Runtime、ModelClient 三层边界，工具声明与执行双面，memory 作为状态源，以及事件流与 trace 的架构定位。"
+tags: [concept]
+---
 
+# Agent 架构
 `ai4j-agent` 的架构核心，不是“封装一下模型调用”，而是把多步推理、工具调用、状态延续和可观测性收敛成一套可复用 runtime。
 
 如果你把它当成一个“大一点的 SDK helper”，很多设计都会显得复杂；一旦把它当成“通用 Agent runtime”，这些分层就会合理很多。
@@ -136,6 +141,31 @@ Agents
 | `ToolExecutor` | 工具执行面 |
 | `AgentMemory` | 状态源 |
 | `AgentEventPublisher` | 运行事件总线 |
+
+## 2.1 运行机理全景图（交互式）
+
+下图把上面的对象关系落成一次 `run` 的真实链路：`AgentBuilder` 装配 → `newSession()` 持有 context 与 memory → `AgentRuntime` 的 ReAct 步循环驱动 `AgentModelClient` 与 LLM 往返（①–③），命中 `tool_calls` 时经 `ToolExecutor` 执行宿主工具并回写 `AgentMemory`（④⑤⑦），全程向 `AgentEventPublisher` 扇出 STEP/MODEL/TOOL/HANDOFF 事件（⑧），memory 再下沉到 `SessionStore` 持久化。可点顶部「引导视图」按 装配与入参 → ReAct 步循环 → 事件扇出 三段浏览，节点上的「来源」徽标对应 `ai4j-agent/src/main/java/io/github/lnyocly/ai4j/agent/` 下的真实源码位置。
+
+import useBaseUrl from '@docusaurus/useBaseUrl';
+
+<iframe
+  src={useBaseUrl('/archify/agent-core-runtime.html')}
+  title="ai4j 基础 Agent 运行机理交互式架构图"
+  style={{width: '100%', height: 940, border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: 8}}
+/>
+
+<a href={useBaseUrl('/archify/agent-core-runtime.html')} target="_blank" rel="noopener noreferrer">在新窗口打开全屏大图</a>（含明暗双主题、缩放与导出）。
+
+**视角补充：ReAct 单步执行时序** — 一步内部的调用序：压缩检查 → BEFORE_TURN 钩子 → buildPrompt → 模型执行 → 工具调用归一化/执行 → 结果回写 AgentMemory → 事件发布。
+
+<iframe
+  src={useBaseUrl('/archify/agent-react-step-loop.html')}
+  title="agent-react-step-loop"
+  style={{width: '100%', height: 940, border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: 8}}
+/>
+
+<a href={useBaseUrl('/archify/agent-react-step-loop.html')} target="_blank" rel="noopener noreferrer">在新窗口打开全屏大图</a>（含明暗双主题、缩放与导出）。
+
 
 ## 3. 构建阶段到底做了什么
 
@@ -399,7 +429,9 @@ Builder 阶段会直接校验：
 
 ### 9.2 `maxSteps = 0` 代表不设上限
 
+:::warning
 这是实验友好的默认值，但不是生产安全默认值。
+:::
 
 ### 9.3 工具异常默认不会中断整轮运行
 
@@ -432,7 +464,9 @@ TOOL_ERROR: {...}
 
 时，runtime 才会开线程池并行跑工具。
 
+:::note
 所以自定义 executor 必须自己保证线程安全。
+:::
 
 ## 10. 这个架构不解决什么
 
@@ -461,7 +495,7 @@ TOOL_ERROR: {...}
 ## 12. 继续阅读
 
 1. [Quickstart](/docs/agent/quickstart)
-2. [Tools and Registry](/docs/agent/tools-and-registry)
-3. [Memory and State](/docs/agent/memory-and-state)
-4. [Runtime Implementations](/docs/agent/runtime-implementations)
-5. [Trace 与可观测性](/docs/agent/trace-observability)
+2. [工具与注册表](/docs/agent/tools-and-registry)
+3. [记忆与状态](/docs/agent/memory/memory-and-state)
+4. [运行时实现](/docs/agent/runtimes/runtime-implementations)
+5. [Trace 与可观测性](/docs/agent/observability/trace-observability)

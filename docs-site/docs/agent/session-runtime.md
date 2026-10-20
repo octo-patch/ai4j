@@ -1,9 +1,11 @@
 ---
 sidebar_position: 5
+title: Agent 会话运行时
+description: 讲解 AgentSession 长程运行态容器：sessionId、独立 memory、event log、snapshot/restore 与 AgentSessionStore，以及它与 memory/compact、Coding Agent/CLI 的边界和生产实现建议。
+tags: [concept]
 ---
 
-# Agent Session Runtime
-
+# Agent 会话运行时
 `AgentSession` 是 `ai4j-agent` 的长程运行态入口。它不是另一个模型客户端，也不是 CLI 会话的替代品，而是把一次 Agent 任务的状态收拢到一个可保存、可恢复、可观测的容器里。
 
 ## 1. 它解决什么问题
@@ -70,7 +72,23 @@ System.out.println(result.getOutputText());
 System.out.println(session.getEventLog().getEvents().size());
 ```
 
+:::warning memorySupplier 必须返回独立实例
 重点是 `memorySupplier(...)`：每次 `newSession()` 都应该拿到独立 memory。否则多个 session 可能共享同一个 memory 实例。
+:::
+
+### 3.1 异步运行：`runAsync`
+
+`Agent.runAsync(request)` 把一次运行调度到共享 daemon 线程池，返回 `CompletableFuture<AgentResult>`：
+
+```java
+CompletableFuture<AgentResult> future = agent.runAsync(
+    AgentRequest.builder().input("分析这个问题").build());
+
+// 需要自控线程池时传入自己的 Executor
+CompletableFuture<AgentResult> onMine = agent.runAsync(request, myExecutor);
+```
+
+`runAsync` 是 `Agent` 上的薄封装——语义与 `agent.run(request)` 一致（不创建 session），只是换了执行线程；运行异常经 `CompletableFuture` 以异常完成传播。默认池线程是 daemon 的 `ai4j-agent-async-N`，长时间阻塞调用建议传业务自己的 `Executor`。
 
 ## 4. 保存和恢复
 
@@ -93,7 +111,9 @@ session.save();
 AgentSession resumed = agent.resumeSession(session.getSessionId());
 ```
 
+:::warning InMemoryAgentSessionStore 不适用于生产
 `InMemoryAgentSessionStore` 只适合本地测试和 demo。生产环境应实现自己的 `AgentSessionStore`，例如 JDBC、Redis、对象存储或业务自有 session 表。
+:::
 
 ## 5. Snapshot 包含什么
 
@@ -151,9 +171,59 @@ P0-B 已补上：
 - `AgentSession.compact(...)`
 - `AgentSessionSnapshot.compactResult`
 
-使用细节见 [Memory Compact Context Projector](/docs/agent/memory-compact-context)。
+使用细节见 [记忆压缩与上下文投影器](/docs/agent/memory/memory-compact-context)。
 
-## 8. 与 Coding Agent / CLI 的关系
+## 8. 会话事件契约（每次 memory 变更必有事件）
+
+会话事件日志不只是观测面——它是会话状态的可重建记录。runtime 对 memory 的每一次写入都会同步发布一条事件，因此把事件流按顺序折叠（fold）就能重建出与 `memory.snapshot()` 完全一致的 `items + summary`。
+
+import useBaseUrl from '@docusaurus/useBaseUrl';
+
+<iframe
+  src={useBaseUrl('/archify/session-event-contract.html')}
+  title="会话事件契约 · 交互式架构图"
+  style={{width: '100%', height: 940, border: '1px solid var(--ifm-color-emphasis-300)', borderRadius: 8}}
+/>
+
+<a href={useBaseUrl('/archify/session-event-contract.html')} target="_blank" rel="noopener noreferrer">在新窗口打开全屏大图</a>（含双主题、缩放与导出功能；右上角视角切换可分别聚焦写点事件化、restore 统一漏斗、投影与一致性）。
+
+变更语义事件一览：
+
+| 事件 | 触发点 | payload |
+| --- | --- | --- |
+| `USER_INPUT` | `memory.addUserInput` | 原始输入对象 |
+| `MEMORY_ITEMS_APPENDED` | `memory.addOutputItems` | 追加的 item 列表 |
+| `TOOL_RESULT` | `memory.addToolOutput`（复用既有事件） | `AgentToolResult` |
+| `TOOL_OUTPUT_REPLACED` | `session.replaceToolOutput` 异步补丁 | `{callId, output}` |
+| `MEMORY_COMPRESS` | `session.compact` / autoCompact | `CompactResult`（含压缩后 memory 快照） |
+| `SESSION_RESTORED` | `session.restore(snapshot)`——resume、fork、harness 快照补丁的统一入口 | 安装的 `MemorySnapshot` 基线 |
+
+配套投影器 `SessionEventProjector`：`deriveSnapshot(events)` / `deriveItems(events)` / `deriveSummary(events)` 把事件流折叠回 memory 状态，可用于审计、fork、离线分析与一致性校验（`SessionEventConsistencyTest` 断言投影==快照）。
+
+注意两点：
+
+- `MEMORY_COMPRESS` 有两种 payload：携带 `CompactResult` 的是真正的 memory 重写；携带投影报告的是请求级 `ContextProjection`（只影响当次 prompt，不改 memory），投影器按 payload 类型区分。
+- 内存实现内部的压缩器（`InMemoryAgentMemory.setCompressor`）在 `add*` 内部重写，不单独发事件——该路径不在事件契约内。
+
+### 8.1 离线读取：`SessionLogReader`
+
+审计、调试与 eval 场景不需要拉起 runtime——`SessionLogReader.of(store)` 在 `AgentSessionStore` 之上提供统一读入口：
+
+```java
+SessionLogReader reader = SessionLogReader.of(store);
+
+reader.listSessionIds();                       // 全部会话 id
+AgentSessionSnapshot s = reader.read(id);      // 持久化快照（含 memory + events）
+List<AgentSessionEvent> all = reader.events(id);        // 全量事件（append 序）
+reader.search(id, AgentEventType.USER_INPUT);           // 按类型过滤
+reader.search(id, e -> e.getSequence() > 100);          // 谓词过滤
+MemorySnapshot m = reader.project(id);                  // 折叠事件流回 memory 状态
+reader.fork(id, "audit-copy");                          // 复制快照为新会话，源不动
+```
+
+读操作全部不改存储；`fork` 在**新 session id** 下写入快照副本（事件历史一并深拷贝），是审计回放与分支实验的安全起点。`project` 与 `SessionEventProjector` 同源——对遵循事件契约写入的会话，投影结果与运行期 `memory.snapshot()` 一致。
+
+## 9. 与 Coding Agent / CLI 的关系
 
 `AgentSession` 是通用 SDK 层能力。
 
@@ -169,7 +239,7 @@ P0-B 已补上：
 
 但这些不应该反向污染 `ai4j-agent` 的通用运行时。SDK 层只保留通用会话、事件、memory、snapshot 和 store 合同。
 
-## 9. 生产实现建议
+## 10. 生产实现建议
 
 生产侧实现 `AgentSessionStore` 时建议注意：
 
@@ -179,7 +249,7 @@ P0-B 已补上：
 - store 写入应该由业务决定同步或异步，不要让每个事件都强制阻塞主 loop。
 - 如果 memory 或 event 很大，应结合 compact / retention policy。
 
-## 10. 下一步
+## 11. 下一步
 
 P0-A 只是运行态容器基础。完整 Agent SDK 还会继续推进：
 
@@ -190,4 +260,4 @@ P0-A 只是运行态容器基础。完整 Agent SDK 还会继续推进：
 5. CLI `/sandbox` 体验
 6. 远端 Agent Runner
 
-完整路线见 [AI4J Agent SDK Roadmap](/docs/agent/sdk-roadmap)。
+完整路线见 [AI4J Agent SDK 路线图](/docs/reference/about/sdk-roadmap)。
